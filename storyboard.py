@@ -904,7 +904,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.3, help="场景检测灵敏度，默认 0.3")
     ap.add_argument("--cols", type=int, default=4, help="宫格列数，默认 4")
     ap.add_argument("--per-page", type=int, default=24,
-                    help="每张宫格图最多放几个镜头，超出自动分成多张。默认 24")
+                    help="每张宫格图最多放几个镜头，超出自动分成多张。默认 24\n"
+                         "注意：真实容量受「单页长边不超过 2000px」约束，"
+                         "16:9 视频实际最多 20 格，超了会自动降下来并多分页（避免图被压糊）")
     ap.add_argument("--max", type=int, default=0,
                     help="总共最多保留几个镜头（抽样）。0=不限制，长视频靠分页而不是丢弃。默认 0")
     ap.add_argument("--transcribe", choices=["auto", "on", "off"], default="auto",
@@ -957,6 +959,8 @@ def main():
 
     # ---- 指定时间点模式：给了 --at 就跳过场景检测，直接按时刻出图 ----
     fixed_times = None
+    if args.at and args.auto_keys:
+        print("      注意：同时给了 --at 和 --auto-keys，以 --at 为准，--auto-keys 被忽略")
     if args.at:
         fixed_times = [t for t in parse_time_list(args.at) if 0 <= t <= duration]
         if not fixed_times:

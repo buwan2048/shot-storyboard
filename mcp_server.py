@@ -61,13 +61,16 @@ def tool_make_storyboard(args):
     cols = int(args.get("cols", 4))
     per_page = int(args.get("per_page", 24))
     max_shots = int(args.get("max_shots", 0))
-    max_images = int(args.get("max_images", 3))
     outdir = args.get("outdir")
     at_times = args.get("at_times")
     crop_spec = args.get("crop")
     zoom = float(args.get("zoom", 1.0) or 1.0)
     auto_keys = int(args.get("auto_keys", 0) or 0)
     scan_spec = args.get("scan")
+
+    # at_times 和 auto_keys 同时给会静默丢掉后者，这里明确提醒一下
+    if at_times and auto_keys:
+        log("同时给了 at_times 和 auto_keys，以 at_times 为准，auto_keys 被忽略")
 
     if not (0.0 < threshold < 1.0):
         raise ValueError("threshold 必须在 0 和 1 之间（建议 0.2~0.5）")
