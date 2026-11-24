@@ -338,11 +338,65 @@ def find_whisper_cpp():
     return None
 
 
-def transcribe_cpp(video, cli, model, ffmpeg, lang="zh", hint=None, out_dir=None):
-    """用 whisper.cpp 转录。先把音频转成 16k 单声道 wav，再喂给 whisper-cli。"""
+def detect_speech_ranges(ffmpeg, wav, noise_db=-32, min_sil=0.55, min_speech=0.35, merge_gap=1.2):
+    """
+    用 ffmpeg 的 silencedetect 找出「有声音」的区间。
+    这是防止 whisper 时间戳漂移的关键：只把有声段喂给它，静音段不喂。
+
+    返回 [(start_sec, end_sec), ...]
+    """
+    r = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", wav, "-af",
+         f"silencedetect=noise={noise_db}dB:d={min_sil}", "-f", "null", "-"],
+        capture_output=True, text=True, errors="ignore",
+    )
+    text = r.stderr or ""
+    sil_starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+    sil_ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+
+    # 总时长
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", text)
+    total = 0.0
+    if m:
+        total = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+    # 由静音区间反推有声区间：
+    # 语音 = 上一个「静音结束」到这一个「静音开始」之间
+    events = sorted([(t, 0) for t in sil_starts] + [(t, 1) for t in sil_ends])
+    speech = []
+    cursor = 0.0
+    for t, kind in events:
+        if kind == 0:          # 静音开始 → cursor..t 是语音
+            if t - cursor >= min_speech:
+                speech.append((cursor, t))
+            cursor = t
+        else:                  # 静音结束 → 更新 cursor
+            cursor = t
+    if total - cursor >= min_speech:
+        speech.append((cursor, total))
+    if not sil_starts and total > 0:
+        speech = [(0.0, total)]
+
+    # 合并间隔很近的段，减少 whisper 启动次数
+    merged = []
+    for a, b in speech:
+        if merged and a - merged[-1][1] < merge_gap:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def transcribe_cpp(video, cli, model, ffmpeg, lang="zh", hint=None, out_dir=None, use_vad_slice=True):
+    """
+    用 whisper.cpp 转录。
+    先把音频转成 16k 单声道 wav，再按「有声区间」切片逐段识别，时间加回偏移。
+
+    为什么要切片：整段喂进去时，开头的静音会让 whisper 时间戳整体前移
+    （实测 5 秒的安静开头，能把第一句从 5.7s 标到 0.0s）。
+    """
     work = out_dir or tempfile.mkdtemp(prefix="sb_wcpp_")
     wav = os.path.join(work, "_audio16k.wav")
-    prefix = os.path.join(work, "_wcpp_out")
     try:
         r = subprocess.run(
             [ffmpeg, "-y", "-v", "error", "-i", video, "-ar", "16000", "-ac", "1",
@@ -352,39 +406,59 @@ def transcribe_cpp(video, cli, model, ffmpeg, lang="zh", hint=None, out_dir=None
         if r.returncode != 0 or not os.path.isfile(wav):
             return None, "提取音频失败：" + (r.stderr or "")[-200:]
 
-        cmd = [cli, "-m", model, "-f", wav, "-l", lang, "-oj", "-of", prefix]
-        if hint:
-            cmd += ["--prompt", hint]      # 引导专有名词
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=3600)
-        js = prefix + ".json"
-        if not os.path.isfile(js):
-            tail = (r.stderr or "")[-300:]
-            return None, "whisper.cpp 没产出结果：" + tail
-        import json as _json
-        with open(js, encoding="utf-8") as f:
-            data = _json.load(f)
-        segs = []
-        for s in data.get("transcription", []):
-            t = (s.get("text") or "").strip()
-            if not t:
-                continue
-            off = s.get("offsets") or {}
-            segs.append({
-                "start": round(off.get("from", 0) / 1000.0, 2),
-                "end": round(off.get("to", 0) / 1000.0, 2),
-                "text": t,
-            })
-        return segs, None
+        # 切出有声区间
+        ranges = detect_speech_ranges(ffmpeg, wav) if use_vad_slice else [(0.0, 0.0)]
+        if not ranges:
+            return [], None            # 整段没声音
+
+        all_segs = []
+        for idx, (a, b) in enumerate(ranges):
+            piece = os.path.join(work, f"_piece_{idx}.wav")
+            prefix = os.path.join(work, f"_wseg_{idx}")
+            try:
+                rr = subprocess.run(
+                    [ffmpeg, "-y", "-v", "error", "-ss", f"{a:.3f}", "-to", f"{b:.3f}",
+                     "-i", wav, "-c:a", "pcm_s16le", piece],
+                    capture_output=True, text=True, errors="ignore", timeout=300,
+                )
+                if rr.returncode != 0 or not os.path.isfile(piece):
+                    continue
+                cmd = [cli, "-m", model, "-f", piece, "-l", lang, "-oj", "-of", prefix]
+                if hint:
+                    cmd += ["--prompt", hint]
+                subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=1800)
+                js = prefix + ".json"
+                if not os.path.isfile(js):
+                    continue
+                import json as _json
+                with open(js, encoding="utf-8") as f:
+                    data = _json.load(f)
+                for s in data.get("transcription", []):
+                    t = (s.get("text") or "").strip()
+                    if not t:
+                        continue
+                    off = s.get("offsets") or {}
+                    st = off.get("from", 0) / 1000.0 + a
+                    en = off.get("to", 0) / 1000.0 + a
+                    all_segs.append({"start": round(st, 2), "end": round(en, 2), "text": t})
+            finally:
+                for p in (piece, prefix + ".json", prefix + ".txt", prefix + ".srt", prefix + ".vtt"):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+        all_segs.sort(key=lambda x: x["start"])
+        return all_segs, None
     except subprocess.TimeoutExpired:
         return None, "whisper.cpp 转录超时"
     except Exception as e:
         return None, f"whisper.cpp 出错：{e}"
     finally:
-        for p in (wav, prefix + ".json", prefix + ".txt", prefix + ".srt", prefix + ".vtt"):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
 
 
 def find_whisper_python():
@@ -555,6 +629,13 @@ def clean_segments(segs, min_dur=0.15, max_repeat=3, duration=None):
             continue
         if duration and s["start"] >= duration - 0.2:
             continue                       # 超出片长，必是幻觉
+        # whisper 的典型幻觉：整句被括号包住、带「字幕:」字样、纯标点/音乐符号
+        if re.fullmatch(r"[\(（\[【].*[\)）\]】]", t):
+            continue
+        if re.search(r"字幕[:：]|subtitle|字幕由|识别字幕", t, re.I):
+            continue
+        if re.fullmatch(r"[♪♫\s\.\,\!\?\-\—…·。，、！？]+", t):
+            continue
         if merged and merged[-1]["text"] == t and s["start"] - merged[-1]["end"] < 0.3:
             merged[-1]["end"] = s["end"]
             continue
