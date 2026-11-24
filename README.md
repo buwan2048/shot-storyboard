@@ -63,6 +63,23 @@ pip install pillow
 python storyboard.py 你的视频.mp4
 ```
 
+### 也可以直接给视频链接
+
+```bash
+python storyboard.py https://www.bilibili.com/video/BV19Rn26CExe
+```
+
+支持 B 站、YouTube 以及 yt-dlp 能处理的站点，会自动下载到临时目录、抽完帧就删。
+
+**需要额外装 yt-dlp**（处理链接才用得到，本地文件不需要）：
+
+```bash
+pip install -U yt-dlp
+```
+
+> 有些视频需要登录才能下（比如 B 站 1080P 高码率）。遇到这种情况，用 `yt-dlp --cookies-from-browser chrome` 先手动下到本地，再把文件路径传给脚本。
+
+
 输出两个文件（和视频同目录）：
 
 - `你的视频_storyboard.jpg` —— 宫格图，喂给 AI
