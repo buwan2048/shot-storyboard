@@ -198,6 +198,7 @@ TOOLS = [
             "把一条视频压成一张镜头宫格图，让只能读文字的模型也能看懂画面结构。"
             "当用户让你分析/审阅/评价一条视频、或问片子怎么剪的时候，先用这个工具，"
             "拿到宫格图再回答，不要凭空猜视频内容。"
+            "接受本地视频路径，也接受网络视频链接（B站/YouTube 等，会自动下载）。"
             "返回：宫格图（每格带镜头编号、起始时间码、时长）+ 精确镜头时间表。"
         ),
         "inputSchema": {
@@ -205,7 +206,11 @@ TOOLS = [
             "properties": {
                 "video_path": {
                     "type": "string",
-                    "description": "视频文件的本地绝对路径",
+                    "description": (
+                        "视频来源。可以是本地文件绝对路径（如 D:/片子.mp4），"
+                        "也可以是网络链接（如 https://www.bilibili.com/video/BV... 、"
+                        "https://b23.tv/xxx 、YouTube 链接），链接会自动下载后抽帧。"
+                    ),
                 },
                 "threshold": {
                     "type": "number",
