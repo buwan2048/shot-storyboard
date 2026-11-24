@@ -253,22 +253,125 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56):
     return width, height
 
 
+def _log(msg):
+    """进度输出。CLI 下打到 stdout；被 MCP 导入时会换成 stderr（否则污染协议流）"""
+    print(msg)
+
+
+def set_logger(fn):
+    global _log
+    _log = fn
+
+
+def find_ytdlp():
+    """找 yt-dlp（用于下载网络视频链接）"""
+    for name in ("yt-dlp", "yt-dlp.exe", "yt_dlp"):
+        p = shutil.which(name)
+        if p:
+            return p
+    if sys.platform == "win32":
+        import glob
+        cands = [
+            os.path.expandvars(r"%USERPROFILE%\.local\bin\yt-dlp.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python3*\Scripts\yt-dlp.exe"),
+            os.path.expandvars(r"%APPDATA%\Python\Python3*\Scripts\yt-dlp.exe"),
+        ]
+        for pat in cands:
+            hits = sorted(glob.glob(pat))
+            if hits:
+                return hits[-1]
+    else:
+        for cand in ("/usr/local/bin/yt-dlp", "/opt/homebrew/bin/yt-dlp", "/usr/bin/yt-dlp"):
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def is_url(s):
+    s = str(s).strip()
+    return s.lower().startswith(("http://", "https://", "www.", "bilibili.com", "b23.tv", "youtube.com", "youtu.be"))
+
+
+def download_video(url, outdir, ffmpeg, max_height=1080):
+    """
+    用 yt-dlp 把网络视频下到本地临时目录，返回本地文件路径。
+    支持 B 站、YouTube 等 yt-dlp 能处理的站点。
+    """
+    ytdlp = find_ytdlp()
+    if not ytdlp:
+        raise RuntimeError(
+            "这是网络链接，需要 yt-dlp 才能下载。装一下：\n"
+            "  pip install -U yt-dlp\n"
+            "或者直接把视频下载到本地，然后传本地文件路径。"
+        )
+
+    ffdir = os.path.dirname(os.path.abspath(ffmpeg))
+    tmpl = os.path.join(outdir, "_dl.%(ext)s")
+    cmd = [
+        ytdlp,
+        "--no-playlist",
+        "--no-warnings",
+        "--ffmpeg-location", ffdir,
+        "-f", f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
+        "--merge-output-format", "mp4",
+        "-o", tmpl,
+        url,
+    ]
+    _log(f"[下载] {url}")
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore")
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-4:]
+        hint = ""
+        low = (r.stderr or "").lower()
+        if "cookies" in low or "premium" in low or "login" in low:
+            hint = (
+                "\n提示：这条视频需要登录才能下。可以在命令后面加 cookies，"
+                "例如命令行用 yt-dlp --cookies-from-browser chrome；"
+                "或把视频下载到本地后再传文件路径。"
+            )
+        raise RuntimeError("下载失败：\n" + "\n".join(tail) + hint)
+
+    cand = os.path.join(outdir, "_dl.mp4")
+    if os.path.isfile(cand):
+        return cand
+    # 有些站点合出来是 mkv/webm
+    for ext in (".mkv", ".webm", ".flv", ".mp4"):
+        p = os.path.join(outdir, "_dl" + ext)
+        if os.path.isfile(p):
+            return p
+    hits = [f for f in os.listdir(outdir) if f.startswith("_dl.")]
+    if hits:
+        return os.path.join(outdir, hits[0])
+    raise RuntimeError("下载完成但找不到输出文件")
+
+
 def main():
     ap = argparse.ArgumentParser(description="视频 → 镜头宫格图（给 AI 读）")
-    ap.add_argument("video", help="输入视频路径")
+    ap.add_argument("video", help="输入视频路径，或网络视频链接（B站/YouTube 等）")
     ap.add_argument("-o", "--outdir", default=None, help="输出目录，默认与视频同目录")
     ap.add_argument("--threshold", type=float, default=0.3, help="场景检测灵敏度，默认 0.3")
     ap.add_argument("--cols", type=int, default=4, help="宫格列数，默认 4")
     ap.add_argument("--max", type=int, default=24, help="最多保留几个镜头，默认 24")
     args = ap.parse_args()
 
-    if not os.path.isfile(args.video):
-        sys.exit(f"找不到视频：{args.video}")
-
     ffmpeg = find_ffmpeg()
-    video = os.path.abspath(args.video)
-    stem = os.path.splitext(os.path.basename(video))[0]
-    outdir = os.path.abspath(args.outdir or os.path.dirname(video))
+
+    # 网络链接：先下载到临时目录
+    tmp_dl = None
+    if is_url(args.video):
+        tmp_dl = tempfile.mkdtemp(prefix="sb_dl_")
+        try:
+            video = download_video(args.video, tmp_dl, ffmpeg)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        stem = "网络视频"
+    else:
+        if not os.path.isfile(args.video):
+            sys.exit(f"找不到视频：{args.video}")
+        video = os.path.abspath(args.video)
+        stem = os.path.splitext(os.path.basename(video))[0]
+
+    outdir = os.path.abspath(args.outdir or (tmp_dl or os.path.dirname(video)))
     os.makedirs(outdir, exist_ok=True)
 
     print(f"[1/4] 读时长: {video}")
