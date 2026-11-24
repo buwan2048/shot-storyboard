@@ -105,6 +105,64 @@ python storyboard.py 片子.mp4 --threshold 0.4 --cols 5 --max 30 -o ./out
 
 ---
 
+## 让 AI 自己用它（MCP）
+
+这才是这个工具的正确用法：**配一次，之后你只要说"帮我看看这条视频"，AI 自己就会抽帧、读图、给分析。**
+
+`mcp_server.py` 是零依赖的 MCP 服务器（只用 Python 标准库），不需要额外装包。
+
+### Claude Desktop
+
+配置文件：
+- Windows：`%APPDATA%\Claude\claude_desktop_config.json`
+- macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "storyboard": {
+      "command": "python",
+      "args": ["D:/你的路径/shot-storyboard/mcp_server.py"]
+    }
+  }
+}
+```
+
+### Cursor / Cline
+
+配置文件 `~/.cursor/mcp.json`，格式同上。
+
+### DSH（DeepSeek Harness）
+
+编辑 `~/.dsh/profiles/<你的profile>/cordis.patch.yml`，加一段：
+
+```yaml
+- insert:
+    - id: mcp-storyboard
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: storyboard
+        transport: stdio
+        command: 'python'
+        args:
+          - 'D:/你的路径/shot-storyboard/mcp_server.py'
+```
+
+### 配好之后会发生什么
+
+AI 会多出一个工具 `make_storyboard`。你发一条视频路径给它，说"看看这条片子怎么剪的"，它会：
+
+1. 自己调 `make_storyboard`
+2. **直接收到宫格图**（不用你自己打开看）
+3. 拿到精确的镜头时间表
+4. 用编号和时间码回答你
+
+如果 AI 没主动用，你可以直接说："**先抽帧再分析**"。
+
+> 目录里的 `AGENTS.md` 是写给 AI 看的规则文件 —— Claude Code / Cursor / DSH 打开这个文件夹时会自动读，告诉 AI 什么时候必须抽帧、怎么回答。不用你每次提醒。
+
+---
+
 ## 遇到问题
 
 装不上、报错、中文乱码、阈值怎么调 —— 看 **[使用说明.md](使用说明.md)**，里面有报错对照表和常见问题。
