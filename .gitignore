@@ -1,5 +1,8 @@
 ﻿__pycache__/
 *.pyc
-*.storyboard.jpg
+*_storyboard.jpg
 *_shots.json
-__*.png
+*.png
+
+# whisper 模型太大，不进仓库，用 下载模型.bat 获取
+whisper-cpp/models/*.bin
