@@ -34,6 +34,41 @@ import subprocess
 import sys
 import tempfile
 
+def fix_console_encoding():
+    """
+    Windows 上 Python 的输出编码和终端代码页经常对不上，导致中文变乱码。
+    这里读一下真实控制台代码页，把 stdout/stderr 调成同一个编码。
+    输出被重定向（管道/文件）时不动，保持调用方期望的编码。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+        if cp in (0, None):
+            # 输出被重定向（管道/文件）时没有控制台，统一用 UTF-8 更通用
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+            return
+        target = {936: "gbk", 950: "big5", 65001: "utf-8", 54936: "gb18030"}.get(cp)
+        if not target:
+            return
+        cur = (sys.stdout.encoding or "").lower().replace("-", "")
+        if cur and cur != target.replace("-", ""):
+            try:
+                sys.stdout.reconfigure(encoding=target, errors="replace")
+                sys.stderr.reconfigure(encoding=target, errors="replace")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+fix_console_encoding()
+
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
