@@ -208,9 +208,11 @@ def fmt_time(sec):
     return f"{int(m):02d}:{s:04.1f}"
 
 
-def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, shot_lines=None, page_info=None):
+def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, shot_lines=None,
+               page_info=None, start_index=0):
     """拼宫格，每格上方烧「编号 + 起始时间 + 时长」，可选下方加台词
-    page_info = (当前页, 总页数, 镜头总数) 时，标题会显示页码"""
+    page_info = (当前页, 总页数, 镜头总数) 时，标题会显示页码
+    start_index = 本页第一个镜头在全片中的序号偏移（分页时保证编号连续）"""
     if not frames:
         sys.exit("没抓到任何帧")
 
@@ -250,9 +252,9 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, sh
             im = im.resize((cell_w, cell_h), Image.LANCZOS)
             sheet.paste(im, (x, y))
 
-        # 大编号（左上角压在画面上）
+        # 大编号（左上角压在画面上）—— 分页时保持全片连续编号
         draw.rectangle([x, y, x + 62, y + 46], fill=(0, 0, 0))
-        draw.text((x + 12, y + 4), f"{i+1:02d}", fill=(255, 200, 60), font=font_idx)
+        draw.text((x + 12, y + 4), f"{i + 1 + start_index:02d}", fill=(255, 200, 60), font=font_idx)
 
         # 时间码
         label = f"start {fmt_time(s)}   dur {e-s:.1f}s"
@@ -764,7 +766,7 @@ def main():
         else:
             name = f"{stem}_storyboard_p{pi+1}.jpg"
         jpg = os.path.join(outdir, name)
-        w, h = make_sheet(pf, ps, jpg, cols=args.cols, shot_lines=pl,
+        w, h = make_sheet(pf, ps, jpg, cols=args.cols, shot_lines=pl, start_index=a,
                           page_info=(pi + 1, page_count, total) if page_count > 1 else None)
         pages.append((jpg, w, h, a + 1, b))
 
