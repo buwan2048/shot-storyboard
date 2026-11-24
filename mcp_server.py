@@ -374,8 +374,17 @@ TOOLS = [
                 },
                 "max_images": {
                     "type": "integer",
-                    "description": "最多返回几张图给 AI（避免上下文过大），其余只给文件路径。默认 3",
-                    "default": 3,
+                    "description": "本次最多返回几张图，默认 1（只给第一页，先判断值不值得继续读）。",
+                    "default": 1,
+                },
+                "page": {
+                    "type": "integer",
+                    "description": (
+                        "要第几页（从 1 开始），默认 1。"
+                        "默认只返回第 1 页——先看全局再决定要不要后续页，"
+                        "避免一次性把整条长视频的图都塞进上下文。"
+                    ),
+                    "default": 1,
                 },
                 "at_times": {
                     "type": "string",
@@ -454,21 +463,39 @@ def handle(msg):
             return reply(msg_id, error=f"未知工具: {name}")
         try:
             data, pages = tool_make_storyboard(args)
-            limit = int(args.get("max_images", 3))
+            total_pages = data["page_count"]
+            # 默认只给第 1 页：先看全局，判断这片子值不值得继续读。
+            # 一次糊 3 张上去，等于替调用方把钱花掉了 —— 看不清的片子应该在这里就停。
+            page = int(args.get("page", 1))
+            if page < 1 or page > total_pages:
+                return reply(msg_id, {
+                    "content": [{"type": "text",
+                                 "text": f"page 超范围：共 {total_pages} 页，你给的是 {page}"}],
+                    "isError": True,
+                })
+            limit = int(args.get("max_images", 1))
+            start = page - 1
             content = [{"type": "text", "text": _human_summary(data)}]
-            for idx, (jpg, a, b) in enumerate(pages):
-                if idx >= limit:
+            shown = 0
+            for idx in range(start, len(pages)):
+                if shown >= limit:
                     break
+                jpg, a, b = pages[idx]
                 with open(jpg, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode()
-                if data["page_count"] > 1:
+                if total_pages > 1:
                     content.append({"type": "text",
-                                    "text": f"第 {idx+1}/{data['page_count']} 张（镜头 {a}-{b}）"})
+                                    "text": f"第 {idx+1}/{total_pages} 张（镜头 {a}-{b}）"})
                 content.append({"type": "image", "data": b64, "mimeType": "image/jpeg"})
-            if len(pages) > limit:
+                shown += 1
+            if total_pages > page + shown - 1:
                 content.append({"type": "text",
-                                "text": f"还有 {len(pages)-limit} 张没发出来（避免上下文过大）。" +
-                                        f"文件都在 {os.path.dirname(pages[0][0])}，需要的话告诉我。"})
+                                "text": (f"还有 {total_pages - (page + shown - 1)} 页没发。"
+                                         f"\n先判断这一页够不够用：够就回答，别再要；"
+                                         f"不够再传 page={page + shown} 取下一页。"
+                                         f"\n如果这一页里字都糊、明显读不出，而片子又全是小字内容，"
+                                         f"别硬要后续页——说明这片子不适合宫格，改用 at_times + crop，"
+                                         f"或者直接告诉用户「这类视频要靠原图裁切」。")})
             return reply(msg_id, {"content": content, "isError": False})
         except Exception as e:
             log(f"tool error: {e}")
