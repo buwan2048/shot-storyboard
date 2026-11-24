@@ -236,7 +236,12 @@ def tool_make_storyboard(args):
             name = (f"{stem}_storyboard.jpg" if page_count == 1
                     else f"{stem}_storyboard_p{pi+1}.jpg")
             jpg = os.path.join(outdir, name)
-            sb.make_sheet(frames[a:b], kept[a:b], jpg, cols=cols,
+            # 最后一页格子不满时缩列数，否则右边留一片空白，白花 token
+            cur_cols = cols
+            remain = b - a
+            if remain < cur_cols:
+                cur_cols = remain
+            sb.make_sheet(frames[a:b], kept[a:b], jpg, cols=cur_cols,
                           shot_lines=(kept_lines[a:b] if segments else None), start_index=a,
                           page_info=((pi + 1, page_count, total) if page_count > 1 else None))
             _shrink(jpg, MAX_IMAGE_SIDE)

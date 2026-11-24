@@ -1131,7 +1131,12 @@ def main():
         else:
             name = f"{stem}_storyboard_p{pi+1}.jpg"
         jpg = os.path.join(outdir, name)
-        w, h = make_sheet(pf, ps, jpg, cols=args.cols, shot_lines=pl, start_index=a,
+        # 最后一页格子不满时缩列数：3 格就别按 4 列排，右边一大片空白等于白花钱
+        cur_cols = args.cols
+        remain = b - a
+        if remain < cur_cols:
+            cur_cols = remain
+        w, h = make_sheet(pf, ps, jpg, cols=cur_cols, shot_lines=pl, start_index=a,
                           page_info=(pi + 1, page_count, total) if page_count > 1 else None)
         pages.append((jpg, w, h, a + 1, b))
 
