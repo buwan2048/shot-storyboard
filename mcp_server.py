@@ -131,7 +131,7 @@ def tool_make_storyboard(args):
 
         for i, (s, e) in enumerate(shots):
             png = os.path.join(tmp, f"f{i:03d}.png")
-            sb.grab_frame(ffmpeg, video, s + min(0.35, (e - s) * 0.35), png)
+            sb.grab_frame(ffmpeg, video, sb.pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png)
             if os.path.exists(png) and os.path.getsize(png) > 0:
                 frames.append(png)
                 kept.append((s, e))
