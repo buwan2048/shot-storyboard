@@ -496,6 +496,26 @@ def transcribe_video(video, python_exe, model="base", lang="zh", ffmpeg=None):
             pass
 
 
+def pick_frame_time(s, e, lines=None):
+    """
+    决定这一刻该抽哪一帧。
+    有台词 → 抽「台词在本镜头内覆盖区间的中点」，这样抽到的是正在说话的画面。
+    无台词 → 抽镜头内 35% 位置（和原来一致）。
+
+    whisper 的句首时间常偏早 0.3~1 秒，所以不能直接用句首，用中点更稳。
+    """
+    if lines:
+        best, best_len = None, 0.0
+        for seg in lines:
+            a = max(seg["start"], s)
+            b = min(seg["end"], e)
+            if b - a > best_len:
+                best_len, best = b - a, (a, b)
+        if best and best_len > 0.2:
+            return (best[0] + best[1]) / 2.0
+    return s + min(0.35, (e - s) * 0.35)
+
+
 def split_lines_by_shot(segments, shots):
     """
     把台词按镜头归属，每句只归给「重叠时长最长」的那个镜头，避免跨边界重复。
@@ -734,7 +754,7 @@ def main():
     frames = []
     for i, (s, e) in enumerate(shots):
         png = os.path.join(tmp, f"f{i:03d}.png")
-        grab_frame(ffmpeg, video, s + min(0.35, (e - s) * 0.35), png)
+        grab_frame(ffmpeg, video, pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png)
         if os.path.exists(png):
             frames.append(png)
         else:
