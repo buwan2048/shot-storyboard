@@ -84,6 +84,30 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 
+# ---- 单页图的上限，超过就会被 AI 客户端压缩，字就糊了 ----
+# mcp_server.py 里 MAX_IMAGE_SIDE 必须和这个保持一致。
+MAX_SHEET_SIDE = 2000
+CELL_W = 480        # 每格宽度（固定，格子多也不会变大）
+PAD = 10
+HEADER = 56
+LABEL_H_NO_LINE = 46
+LABEL_H_WITH_LINE = 78
+
+
+def fit_page(cols, cell_h, has_lines, max_side=MAX_SHEET_SIDE):
+    """按「单页长边不超过 max_side」反推：一页最多能放几列几行。
+
+    返回 (cols, rows)。目的：宁可多分几页，也不让图被压缩——
+    图一旦超过 max_side，客户端会等比缩小，每格从 480 掉到两三百，字就废了。
+    """
+    label_h = LABEL_H_WITH_LINE if has_lines else LABEL_H_NO_LINE
+    max_cols = max(1, (max_side - PAD) // (CELL_W + PAD))
+    out_cols = min(cols, max_cols)
+    row_h = cell_h + label_h + PAD
+    max_rows = max(1, (max_side - HEADER - PAD) // row_h)
+    return out_cols, max_rows
+
+
 
 def find_ffmpeg():
     # 1. 先看 PATH
@@ -1071,8 +1095,23 @@ def main():
         shot_lines = [t[2] or [] for t in triples]
 
     # ---- 分页：长视频切成多张图，而不是丢掉镜头 ----
+    # 关键：不是「一页固定塞 N 格」，而是「一页的图不能大到被客户端压缩」。
+    # 图超过 MAX_SHEET_SIDE 就会被等比缩小，每格从 480 掉到两三百，字就废了。
+    # 所以这里按格子算出一页的真实容量，宁可多分页。
     per_page = max(1, args.per_page)
     total = len(frames)
+    if frames:
+        with Image.open(frames[0]) as im0:
+            cell_h = int(CELL_W * (im0.height / im0.width))
+        fit_cols, fit_rows = fit_page(args.cols, cell_h, bool(shot_lines))
+        cap = fit_cols * fit_rows
+        if per_page > cap:
+            print(f"      每页 {per_page} 格会超出 {MAX_SHEET_SIDE}px 上限（会被压缩糊掉），"
+                  f"自动改为每页 {cap} 格（{fit_cols} 列 × {fit_rows} 行）")
+            per_page = cap
+        if args.cols > fit_cols:
+            print(f"      {args.cols} 列会超出宽度上限，自动改为 {fit_cols} 列")
+            args.cols = fit_cols
     page_count = (total + per_page - 1) // per_page if total else 0
     print(f"[4/4] 拼宫格（{total} 个镜头 → {page_count} 张图，每张最多 {per_page} 格）")
 

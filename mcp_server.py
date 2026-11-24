@@ -209,8 +209,22 @@ def tool_make_storyboard(args):
                 except OSError:
                     pass
 
-        # 分页：每页 per_page 格，长视频不会丢镜头
+        # 分页：不是「一页固定塞 N 格」，而是「一页的图不能大到被压缩」。
+        # 图超过上限会被等比缩小，每格从 480 掉到两三百，字就废了 —— 宁可多分页。
         total = len(frames)
+        if frames:
+            w0, h0 = sb.report_image_size(frames[0])
+            if w0 > 0:
+                cell_h = int(sb.CELL_W * (h0 / w0))
+                fit_cols, fit_rows = sb.fit_page(cols, cell_h, bool(segments), MAX_IMAGE_SIDE)
+                cap = fit_cols * fit_rows
+                if per_page > cap:
+                    log(f"每页 {per_page} 格会超出 {MAX_IMAGE_SIDE}px 上限，自动改为 {cap} 格"
+                        f"（{fit_cols} 列 × {fit_rows} 行）")
+                    per_page = cap
+                if cols > fit_cols:
+                    log(f"{cols} 列会超出宽度上限，自动改为 {fit_cols} 列")
+                    cols = fit_cols
         page_count = (total + per_page - 1) // per_page
         pages = []
         for pi in range(page_count):
