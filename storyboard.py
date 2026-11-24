@@ -208,8 +208,8 @@ def fmt_time(sec):
     return f"{int(m):02d}:{s:04.1f}"
 
 
-def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56):
-    """拼宫格，每格上方烧「编号 + 起始时间 + 时长」"""
+def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, shot_lines=None):
+    """拼宫格，每格上方烧「编号 + 起始时间 + 时长」，可选下方加台词"""
     if not frames:
         sys.exit("没抓到任何帧")
 
@@ -218,23 +218,28 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56):
         ratio = im0.height / im0.width
     cell_h = int(cell_w * ratio)
 
+    has_lines = bool(shot_lines) and any(shot_lines)
+    label_h = 46 if not has_lines else 78          # 有台词就多留一行
     rows = (len(frames) + cols - 1) // cols
     width = cols * cell_w + (cols + 1) * pad
-    height = header + rows * (cell_h + header) + (rows + 1) * pad
+    height = header + rows * (cell_h + label_h) + (rows + 1) * pad
 
     sheet = Image.new("RGB", (width, height), (18, 18, 20))
     draw = ImageDraw.Draw(sheet)
     font_title = load_font(26)
     font_label = load_font(22)
     font_idx = load_font(34)
+    font_line = load_font(21)
 
-    draw.text((pad + 4, 14), "STORYBOARD  ·  shot / start / duration",
-              fill=(150, 150, 155), font=font_title)
+    title = "STORYBOARD  ·  shot / start / duration"
+    if has_lines:
+        title += "  /  dialogue"
+    draw.text((pad + 4, 14), title, fill=(150, 150, 155), font=font_title)
 
     for i, (png, (s, e)) in enumerate(zip(frames, shots)):
         r, c = divmod(i, cols)
         x = pad + c * (cell_w + pad)
-        y = header + pad + r * (cell_h + header + pad)
+        y = header + pad + r * (cell_h + label_h + pad)
 
         with Image.open(png) as im:
             im = im.convert("RGB")
@@ -245,9 +250,22 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56):
         draw.rectangle([x, y, x + 62, y + 46], fill=(0, 0, 0))
         draw.text((x + 12, y + 4), f"{i+1:02d}", fill=(255, 200, 60), font=font_idx)
 
-        # 时间码（画面下方）
+        # 时间码
         label = f"start {fmt_time(s)}   dur {e-s:.1f}s"
         draw.text((x + 4, y + cell_h + 6), label, fill=(210, 210, 215), font=font_label)
+
+        # 台词
+        if has_lines:
+            segs = shot_lines[i] if i < len(shot_lines) else []
+            if segs:
+                text = " ".join(x2["text"] for x2 in segs).strip()
+                if len(text) > 30:
+                    text = text[:29] + "…"
+                fill = (255, 214, 130)
+            else:
+                text = "（无台词）"
+                fill = (110, 112, 120)
+            draw.text((x + 4, y + cell_h + 36), text, fill=fill, font=font_line)
 
     sheet.save(out_jpg, quality=88)
     return width, height
@@ -261,6 +279,265 @@ def _log(msg):
 def set_logger(fn):
     global _log
     _log = fn
+
+
+def find_whisper_cpp():
+    """
+    找工具自带的 whisper.cpp（解压即用，零 Python 依赖）。
+    返回 (whisper-cli 路径, 模型路径) 或 None。
+
+    查找顺序：
+      1. 环境变量 WHISPER_CPP_DIR
+      2. 本脚本同目录下的 whisper-cpp/
+      3. 常见安装位置
+    """
+    def probe(root):
+        if not root or not os.path.isdir(root):
+            return None
+        # whisper-cli.exe 可能在根目录，也可能在 Release/ 子目录
+        cli = None
+        for rel in ("whisper-cli.exe", os.path.join("Release", "whisper-cli.exe"),
+                    "whisper-cli", "main", "main.exe"):
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                cli = p
+                break
+        if not cli:
+            return None
+        mdir = os.path.join(root, "models")
+        model = None
+        for name in ("ggml-base.bin", "ggml-small.bin", "ggml-tiny.bin",
+                     "ggml-base.en.bin", "ggml-medium.bin"):
+            p = os.path.join(mdir, name)
+            if os.path.isfile(p):
+                model = p
+                break
+        if not model:
+            import glob as _g
+            hits = sorted(_g.glob(os.path.join(mdir, "ggml-*.bin")))
+            if hits:
+                model = hits[0]
+        if not model:
+            return None
+        return cli, model
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (os.environ.get("WHISPER_CPP_DIR"),
+                 os.path.join(here, "whisper-cpp"),
+                 os.path.join(here, "tools", "whisper-cpp"),
+                 r"D:\Tools\whisper-cpp"):
+        r = probe(root)
+        if r:
+            return r
+    return None
+
+
+def transcribe_cpp(video, cli, model, ffmpeg, lang="zh", hint=None, out_dir=None):
+    """用 whisper.cpp 转录。先把音频转成 16k 单声道 wav，再喂给 whisper-cli。"""
+    work = out_dir or tempfile.mkdtemp(prefix="sb_wcpp_")
+    wav = os.path.join(work, "_audio16k.wav")
+    prefix = os.path.join(work, "_wcpp_out")
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-i", video, "-ar", "16000", "-ac", "1",
+             "-c:a", "pcm_s16le", wav],
+            capture_output=True, text=True, errors="ignore", timeout=600,
+        )
+        if r.returncode != 0 or not os.path.isfile(wav):
+            return None, "提取音频失败：" + (r.stderr or "")[-200:]
+
+        cmd = [cli, "-m", model, "-f", wav, "-l", lang, "-oj", "-of", prefix]
+        if hint:
+            cmd += ["--prompt", hint]      # 引导专有名词
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=3600)
+        js = prefix + ".json"
+        if not os.path.isfile(js):
+            tail = (r.stderr or "")[-300:]
+            return None, "whisper.cpp 没产出结果：" + tail
+        import json as _json
+        with open(js, encoding="utf-8") as f:
+            data = _json.load(f)
+        segs = []
+        for s in data.get("transcription", []):
+            t = (s.get("text") or "").strip()
+            if not t:
+                continue
+            off = s.get("offsets") or {}
+            segs.append({
+                "start": round(off.get("from", 0) / 1000.0, 2),
+                "end": round(off.get("to", 0) / 1000.0, 2),
+                "text": t,
+            })
+        return segs, None
+    except subprocess.TimeoutExpired:
+        return None, "whisper.cpp 转录超时"
+    except Exception as e:
+        return None, f"whisper.cpp 出错：{e}"
+    finally:
+        for p in (wav, prefix + ".json", prefix + ".txt", prefix + ".srt", prefix + ".vtt"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def find_whisper_python():
+    """
+    找一个能 import whisper 的 Python 解释器。
+    优先当前解释器，其次环境变量 WHISPER_PYTHON，最后常见安装位置。
+    返回 None 表示没找到。
+    """
+    try:
+        import whisper  # noqa: F401
+        return sys.executable
+    except ImportError:
+        pass
+
+    cands = []
+    v = os.environ.get("WHISPER_PYTHON")
+    if v:
+        cands.append(v)
+    if sys.platform == "win32":
+        import glob
+        cands += [
+            os.path.expandvars(r"%USERPROFILE%\.local\bin\python.exe"),
+            r"E:\CosyVoice\venv\Scripts\python.exe",
+            r"D:\CosyVoice\venv\Scripts\python.exe",
+        ]
+        for pat in (r"C:\Users\*\AppData\Local\Programs\Python\Python3*\python.exe",):
+            cands += sorted(glob.glob(pat), reverse=True)
+    else:
+        cands += ["/usr/local/bin/python3", "/usr/bin/python3"]
+
+    probe = "import whisper" if True else ""
+    for exe in cands:
+        if not exe or not os.path.isfile(exe):
+            continue
+        try:
+            r = subprocess.run([exe, "-c", "import whisper;print(whisper.__version__ if hasattr(whisper,'__version__') else 'ok')"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                return exe
+        except Exception:
+            continue
+    return None
+
+
+_TRANSCRIBE_RUNNER = r'''
+import json, sys, os
+
+video = sys.argv[1]
+model_name = sys.argv[2] if len(sys.argv) > 2 else "base"
+lang = sys.argv[3] if len(sys.argv) > 3 else "zh"
+
+import whisper
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = whisper.load_model(model_name, device=device)
+result = model.transcribe(
+    video,
+    language=lang,
+    fp16=(device == "cuda"),
+    condition_on_previous_text=False,
+    verbose=False,
+)
+segs = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()}
+        for s in result.get("segments", []) if s.get("text", "").strip()]
+sys.stdout.write("@@JSON@@" + json.dumps(segs, ensure_ascii=False))
+'''
+
+
+def transcribe_video(video, python_exe, model="base", lang="zh", ffmpeg=None):
+    """
+    用 whisper 转录音频，返回 [{"start":秒, "end":秒, "text":"..."}]。
+    找不到 whisper 时返回 (None, 原因)。
+    """
+    if not python_exe:
+        return None, "没找到装 whisper 的 Python"
+
+    # whisper 内部会调 ffmpeg，必须让它能找到
+    env = dict(os.environ)
+    if ffmpeg:
+        fdir = os.path.dirname(os.path.abspath(ffmpeg))
+        env["PATH"] = fdir + os.pathsep + env.get("PATH", "")
+
+    fd, runner = tempfile.mkstemp(suffix=".py", prefix="sb_whisper_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_TRANSCRIBE_RUNNER)
+        r = subprocess.run(
+            [python_exe, runner, video, model, lang],
+            capture_output=True, text=True, errors="replace", env=env, timeout=3600,
+        )
+        if r.returncode != 0:
+            tail = (r.stderr or "").strip().splitlines()[-3:]
+            return None, "whisper 转录失败：" + " / ".join(tail)
+        out = r.stdout or ""
+        marker = out.find("@@JSON@@")
+        if marker < 0:
+            return None, "whisper 没返回结果"
+        import json as _json
+        return _json.loads(out[marker + len("@@JSON@@"):]), None
+    except subprocess.TimeoutExpired:
+        return None, "whisper 转录超时（视频太长）"
+    except Exception as e:
+        return None, f"whisper 转录出错：{e}"
+    finally:
+        try:
+            os.remove(runner)
+        except OSError:
+            pass
+
+
+def split_lines_by_shot(segments, shots):
+    """
+    把台词按镜头归属，每句只归给「重叠时长最长」的那个镜头，避免跨边界重复。
+    返回：[[seg, ...], ...]，与 shots 一一对应
+    """
+    if not segments:
+        return [[] for _ in shots]
+    per = [[] for _ in shots]
+    for seg in segments:
+        best_i, best_ov = None, 0.0
+        for i, (s, e) in enumerate(shots):
+            ov = min(seg["end"], e) - max(seg["start"], s)
+            if ov > best_ov:
+                best_ov, best_i = ov, i
+        if best_i is not None:
+            per[best_i].append(seg)
+    return per
+
+
+def clean_segments(segs, min_dur=0.15, max_repeat=3, duration=None):
+    """
+    清理 whisper 幻觉：
+      - 丢掉过短的碎片
+      - 丢掉超出视频长度的段（whisper 常在结尾凭空生成）
+      - 相邻完全相同的文本合并
+      - 同一句反复出现远超正常次数（BGM/无声段的典型幻觉）整句丢掉
+    返回 (清理后的列表, 丢掉的条数)
+    """
+    if not segs:
+        return [], 0
+    raw_n = len(segs)
+
+    merged = []
+    for s in segs:
+        t = (s.get("text") or "").strip()
+        if not t or (s["end"] - s["start"]) < min_dur:
+            continue
+        if duration and s["start"] >= duration - 0.2:
+            continue                       # 超出片长，必是幻觉
+        if merged and merged[-1]["text"] == t and s["start"] - merged[-1]["end"] < 0.3:
+            merged[-1]["end"] = s["end"]
+            continue
+        merged.append({"start": s["start"], "end": s["end"], "text": t})
+
+    from collections import Counter
+    cnt = Counter(m["text"] for m in merged)
+    out = [m for m in merged if cnt[m["text"]] <= max_repeat]
+    return out, raw_n - len(out)
 
 
 def find_ytdlp():
@@ -352,6 +629,13 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.3, help="场景检测灵敏度，默认 0.3")
     ap.add_argument("--cols", type=int, default=4, help="宫格列数，默认 4")
     ap.add_argument("--max", type=int, default=24, help="最多保留几个镜头，默认 24")
+    ap.add_argument("--transcribe", choices=["auto", "on", "off"], default="auto",
+                    help="识别台词：auto=有 whisper 就转，on=必须转，off=不转（默认 auto）")
+    ap.add_argument("--whisper-model", default="base",
+                    help="whisper 模型大小：tiny/base/small/medium，默认 base（越大越准越慢）")
+    ap.add_argument("--hint", default=None,
+                    help="给语音识别的提示词，写上视频里可能出现的专有名词，能显著提升准确率。"
+                         "例：--hint \"DeepSeek, 剪映, 提示词\"")
     args = ap.parse_args()
 
     ffmpeg = find_ffmpeg()
@@ -391,6 +675,51 @@ def main():
         shots = [shots[int(i * step)] for i in range(args.max)]
         print(f"      超过 {args.max} 个，已等间隔抽到 {args.max} 个")
 
+    # 台词（可选，按镜头切分）
+    shot_lines = None
+    segments = None
+    if args.transcribe != "off":
+        cpp = find_whisper_cpp()
+        if cpp:
+            print(f"[转录] whisper.cpp（{os.path.basename(cpp[1])}）...")
+            segments, err = transcribe_cpp(video, cpp[0], cpp[1], ffmpeg, "zh", args.hint)
+            if segments is not None:
+                raw_n = len(segments)
+                segments, dropped = clean_segments(segments, duration=duration)
+                if dropped:
+                    print(f"      过滤掉 {dropped} 条疑似幻觉/碎片（原 {raw_n} 条）")
+            else:
+                print(f"      跳过：{err}")
+                if args.transcribe == "on":
+                    sys.exit(err)
+        else:
+            wpy = find_whisper_python()
+            if wpy:
+                print(f"[转录] openai-whisper {args.whisper_model} ...（首次加载模型会慢一点）")
+                segments, err = transcribe_video(video, wpy, args.whisper_model, "zh", ffmpeg)
+                if segments is not None:
+                    raw_n = len(segments)
+                    segments, dropped = clean_segments(segments, duration=duration)
+                    if dropped:
+                        print(f"      过滤掉 {dropped} 条疑似幻觉/碎片（原 {raw_n} 条）")
+                else:
+                    print(f"      跳过：{err}")
+                    if args.transcribe == "on":
+                        sys.exit(err)
+            else:
+                msg = ("没有语音识别可用。两个办法：\n"
+                       "  ① 用工具自带的 whisper.cpp：把 whisper-cpp 文件夹放到本目录，\n"
+                       "     里面有 whisper-cli.exe 和 models/ggml-base.bin 就行\n"
+                       "  ② 或者 pip install -U openai-whisper（体积大很多）")
+                print(f"[转录] 跳过：{msg}")
+                if args.transcribe == "on":
+                    sys.exit(msg)
+
+        if segments:
+            shot_lines = split_lines_by_shot(segments, shots)
+            got = sum(1 for l in shot_lines if l)
+            print(f"      识别到 {len(segments)} 句台词，落在 {got}/{len(shots)} 个镜头里")
+
     print("[3/4] 抽帧")
     tmp = tempfile.mkdtemp(prefix="sb_")
     frames = []
@@ -401,13 +730,18 @@ def main():
             frames.append(png)
         else:
             shots[i] = None
-    pairs = [(f, sh) for f, sh in zip(frames, shots) if sh]
-    frames = [p[0] for p in pairs]
-    shots = [p[1] for p in pairs]
+    triples = []
+    for i, (f, sh) in enumerate(zip(frames, shots)):
+        if sh:
+            triples.append((f, sh, shot_lines[i] if shot_lines and i < len(shot_lines) else None))
+    frames = [t[0] for t in triples]
+    shots = [t[1] for t in triples]
+    if shot_lines:
+        shot_lines = [t[2] or [] for t in triples]
 
     print("[4/4] 拼宫格")
     jpg = os.path.join(outdir, f"{stem}_storyboard.jpg")
-    w, h = make_sheet(frames, shots, jpg, cols=args.cols)
+    w, h = make_sheet(frames, shots, jpg, cols=args.cols, shot_lines=shot_lines)
 
     data = {
         "video": video,
@@ -415,10 +749,15 @@ def main():
         "threshold": args.threshold,
         "shot_count": len(shots),
         "shots": [
-            {"no": i + 1, "start": round(s, 3), "end": round(e, 3), "duration": round(e - s, 3)}
+            dict(
+                {"no": i + 1, "start": round(s, 3), "end": round(e, 3), "duration": round(e - s, 3)},
+                **({"lines": [x2["text"] for x2 in shot_lines[i]]} if shot_lines else {})
+            )
             for i, (s, e) in enumerate(shots)
         ],
     }
+    if segments:
+        data["transcript"] = segments
     js = os.path.join(outdir, f"{stem}_shots.json")
     with open(js, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
