@@ -208,8 +208,9 @@ def fmt_time(sec):
     return f"{int(m):02d}:{s:04.1f}"
 
 
-def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, shot_lines=None):
-    """拼宫格，每格上方烧「编号 + 起始时间 + 时长」，可选下方加台词"""
+def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, shot_lines=None, page_info=None):
+    """拼宫格，每格上方烧「编号 + 起始时间 + 时长」，可选下方加台词
+    page_info = (当前页, 总页数, 镜头总数) 时，标题会显示页码"""
     if not frames:
         sys.exit("没抓到任何帧")
 
@@ -234,6 +235,9 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, sh
     title = "STORYBOARD  ·  shot / start / duration"
     if has_lines:
         title += "  /  dialogue"
+    if page_info:
+        cur, total_pages, total_shots = page_info
+        title += f"   ·   page {cur}/{total_pages}   ·   {total_shots} shots total"
     draw.text((pad + 4, 14), title, fill=(150, 150, 155), font=font_title)
 
     for i, (png, (s, e)) in enumerate(zip(frames, shots)):
@@ -628,7 +632,10 @@ def main():
     ap.add_argument("-o", "--outdir", default=None, help="输出目录，默认与视频同目录")
     ap.add_argument("--threshold", type=float, default=0.3, help="场景检测灵敏度，默认 0.3")
     ap.add_argument("--cols", type=int, default=4, help="宫格列数，默认 4")
-    ap.add_argument("--max", type=int, default=24, help="最多保留几个镜头，默认 24")
+    ap.add_argument("--per-page", type=int, default=24,
+                    help="每张宫格图最多放几个镜头，超出自动分成多张。默认 24")
+    ap.add_argument("--max", type=int, default=0,
+                    help="总共最多保留几个镜头（抽样）。0=不限制，长视频靠分页而不是丢弃。默认 0")
     ap.add_argument("--transcribe", choices=["auto", "on", "off"], default="auto",
                     help="识别台词：auto=有 whisper 就转，on=必须转，off=不转（默认 auto）")
     ap.add_argument("--whisper-model", default="base",
@@ -669,11 +676,11 @@ def main():
     shots = build_shots(scenes, duration)
     print(f"      检测到 {len(scenes)} 个切换点 → {len(shots)} 个镜头")
 
-    if len(shots) > args.max:
-        # 太多镜头时按等间隔抽，保证覆盖全片
+    if args.max and args.max > 0 and len(shots) > args.max:
+        # 只有用户显式要求总数上限时才抽样（会丢镜头）
         step = len(shots) / args.max
         shots = [shots[int(i * step)] for i in range(args.max)]
-        print(f"      超过 {args.max} 个，已等间隔抽到 {args.max} 个")
+        print(f"      按 --max {args.max} 等间隔抽样（注意：抽样会丢镜头）")
 
     # 台词（可选，按镜头切分）
     shot_lines = None
@@ -739,15 +746,39 @@ def main():
     if shot_lines:
         shot_lines = [t[2] or [] for t in triples]
 
-    print("[4/4] 拼宫格")
-    jpg = os.path.join(outdir, f"{stem}_storyboard.jpg")
-    w, h = make_sheet(frames, shots, jpg, cols=args.cols, shot_lines=shot_lines)
+    # ---- 分页：长视频切成多张图，而不是丢掉镜头 ----
+    per_page = max(1, args.per_page)
+    total = len(frames)
+    page_count = (total + per_page - 1) // per_page if total else 0
+    print(f"[4/4] 拼宫格（{total} 个镜头 → {page_count} 张图，每张最多 {per_page} 格）")
+
+    pages = []          # [(jpg路径, 宽, 高, 起始镜号, 结束镜号)]
+    for pi in range(page_count):
+        a = pi * per_page
+        b = min(a + per_page, total)
+        pf = frames[a:b]
+        ps = shots[a:b]
+        pl = shot_lines[a:b] if shot_lines else None
+        if page_count == 1:
+            name = f"{stem}_storyboard.jpg"
+        else:
+            name = f"{stem}_storyboard_p{pi+1}.jpg"
+        jpg = os.path.join(outdir, name)
+        w, h = make_sheet(pf, ps, jpg, cols=args.cols, shot_lines=pl,
+                          page_info=(pi + 1, page_count, total) if page_count > 1 else None)
+        pages.append((jpg, w, h, a + 1, b))
 
     data = {
         "video": video,
         "duration": round(duration, 3),
         "threshold": args.threshold,
         "shot_count": len(shots),
+        "page_count": page_count,
+        "per_page": per_page,
+        "pages": [
+            {"file": os.path.basename(j), "width": w, "height": h, "shots": f"{a}-{b}"}
+            for (j, w, h, a, b) in pages
+        ],
         "shots": [
             dict(
                 {"no": i + 1, "start": round(s, 3), "end": round(e, 3), "duration": round(e - s, 3)},
@@ -773,10 +804,13 @@ def main():
         pass
 
     print()
-    print(f"宫格图 : {jpg}  ({w}x{h})")
+    for (j, w, h, a, b) in pages:
+        print(f"宫格图 : {j}  ({w}x{h})  镜头 {a}-{b}")
     print(f"镜头表 : {js}")
     print(f"镜头数 : {len(shots)}")
     print()
+    if page_count > 1:
+        print("图比较多时，按 p1、p2… 顺序看完再下结论。")
     print("把宫格图交给 AI，它就能说出：有几个镜头、每个多长、怎么切、节奏怎么样。")
 
 
