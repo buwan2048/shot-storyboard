@@ -636,6 +636,24 @@ def clean_segments(segs, min_dur=0.15, max_repeat=3, duration=None):
             continue
         if re.fullmatch(r"[♪♫\s\.\,\!\?\-\—…·。，、！？]+", t):
             continue
+        # 强特征：播放器/字幕组水印，出现即丢（不看长度）
+        if re.search(r"独播剧场|獨播劇場|Exclusive|Television Series|字幕組|字幕组|"
+                     r"本字幕|仅供学习|僅供學習|敬请期待|敬請期待", t, re.I):
+            continue
+        # 片尾/播放器字幕信息被当成歌词：「詞曲:XX」「作詞/作曲/編曲/演唱」这类
+        # 判据：整句很短（<28 字）且命中这些制作信息词
+        if len(t) <= 28 and re.search(
+            r"詞曲|词曲|作詞|作词|作曲|編曲|编曲|演唱|原唱|混音|母带|母帶|录音|錄音|"
+            r"翻译|翻譯|校对|校對|提供|Powered|Copyright",
+            t, re.I,
+        ):
+            continue
+        # 「曲:蝕雲 / 詞:蝕雲」「詞:蝕雲」这种制作人员列表：整句以「词/曲/编/唱:」开头
+        if re.match(r"^\s*[詞词曲編编唱混录制監监]\s*[:：]", t):
+            continue
+        # 「曲:蝕雲 / 詞:蝕雲」这种用斜杠分隔的制作人员列表
+        if len(t) <= 40 and len(re.findall(r"[詞词曲编編唱]\s*[:：]", t)) >= 1 and "/" in t:
+            continue
         if merged and merged[-1]["text"] == t and s["start"] - merged[-1]["end"] < 0.3:
             merged[-1]["end"] = s["end"]
             continue
