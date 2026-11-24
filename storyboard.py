@@ -86,16 +86,51 @@ FONT_CANDIDATES = [
 
 
 def find_ffmpeg():
+    # 1. 先看 PATH
     for name in ("ffmpeg", "ffmpeg.exe"):
         p = shutil.which(name)
         if p:
             return p
+
+    # 2. 再看环境变量
+    for var in ("FFMPEG_PATH", "FFMPEG_BIN", "FFMPEG_HOME"):
+        v = os.environ.get(var)
+        if v:
+            for cand in (v, os.path.join(v, "ffmpeg.exe"), os.path.join(v, "bin", "ffmpeg.exe"),
+                         os.path.join(v, "bin", "ffmpeg")):
+                if os.path.isfile(cand):
+                    return cand
+
+    # 3. 常见安装位置（Windows）
+    if sys.platform == "win32":
+        import glob
+        patterns = [
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+            r"D:\ffmpeg\bin\ffmpeg.exe",
+            r"D:\Tools\ffmpeg\*\bin\ffmpeg.exe",
+            r"C:\Tools\ffmpeg\*\bin\ffmpeg.exe",
+            r"D:\软件\ffmpeg\*\bin\ffmpeg.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\*\bin\ffmpeg.exe"),
+            os.path.expandvars(r"%USERPROFILE%\scoop\apps\ffmpeg\current\bin\ffmpeg.exe"),
+            os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe"),
+        ]
+        for pat in patterns:
+            hits = sorted(glob.glob(pat))
+            if hits:
+                return hits[-1]
+    else:
+        for cand in ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg", "/usr/bin/ffmpeg"):
+            if os.path.isfile(cand):
+                return cand
+
+    # 4. 实在找不到，给出分平台指引
     if sys.platform == "win32":
         hint = (
-            "没有找到 ffmpeg。二选一：\n"
+            "没有找到 ffmpeg。三选一：\n"
             "  ① 命令行装：  winget install Gyan.FFmpeg\n"
             "  ② 手动下：    https://www.gyan.dev/ffmpeg/builds/  下 essentials 版，\n"
-            "     解压后把里面的 bin 目录加到系统环境变量 PATH 里，然后重开终端。\n"
+            "     解压到 D:\\Tools\\ffmpeg\\ ，脚本会自动找到。\n"
+            "  ③ 设环境变量： set FFMPEG_PATH=D:\\你的\\ffmpeg\\bin\\ffmpeg.exe\n"
             "装完验证：  ffmpeg -version"
         )
     elif sys.platform == "darwin":
