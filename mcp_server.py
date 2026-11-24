@@ -27,6 +27,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -62,6 +63,11 @@ def tool_make_storyboard(args):
     max_shots = int(args.get("max_shots", 0))
     max_images = int(args.get("max_images", 3))
     outdir = args.get("outdir")
+    at_times = args.get("at_times")
+    crop_spec = args.get("crop")
+    zoom = float(args.get("zoom", 1.0) or 1.0)
+    auto_keys = int(args.get("auto_keys", 0) or 0)
+    scan_spec = args.get("scan")
 
     if not (0.0 < threshold < 1.0):
         raise ValueError("threshold 必须在 0 和 1 之间（建议 0.2~0.5）")
@@ -71,6 +77,8 @@ def tool_make_storyboard(args):
         raise ValueError("per_page 必须在 1~100 之间")
     if max_shots < 0:
         raise ValueError("max_shots 不能为负（0 表示不限制）")
+    if zoom < 1.0:
+        raise ValueError("zoom 不能小于 1（要缩小就别裁）")
 
     ffmpeg = sb.find_ffmpeg()
 
@@ -98,9 +106,51 @@ def tool_make_storyboard(args):
     scenes = sb.detect_scenes(ffmpeg, video, threshold)
     shots = sb.build_shots(scenes, duration)
 
+    # ---- 指定时刻 / 自动挑帧：绕过场景检测，直接抽这几帧 ----
+    fixed_times = None
+    if at_times:
+        if isinstance(at_times, str):
+            fixed_times = sb.parse_time_list(at_times)
+        else:
+            fixed_times = [float(t) for t in at_times]
+        fixed_times = [t for t in fixed_times if 0 <= t <= duration]
+        if not fixed_times:
+            raise ValueError(f"at_times 里的时刻都不在 0~{duration:.1f}s 范围内")
+        shots = [(t, t) for t in fixed_times]
+    elif auto_keys and auto_keys > 0:
+        scan_from, scan_to = 0.0, duration
+        if scan_spec:
+            try:
+                a, b = [float(x) for x in str(scan_spec).split(",")[:2]]
+                scan_from, scan_to = a, b
+            except Exception:
+                raise ValueError("scan 要写成「起,止」秒，例 180,400")
+        log(f"自动挑关键帧: {scan_from:.0f}s~{scan_to:.0f}s 要 {auto_keys} 个")
+        picked = sb.find_busy_times(ffmpeg, video, duration, want=auto_keys,
+                                    scan_from=scan_from, scan_to=scan_to)
+        if not picked:
+            raise ValueError("自动挑帧失败，请改用 at_times 指定时间点")
+        fixed_times = picked
+        shots = [(t, t) for t in picked]
+
+    crop = sb.parse_region(crop_spec) if crop_spec else None
+    if crop and zoom <= 1.0:
+        zoom = 2.0
+    if crop:
+        vw, vh = sb.probe_size(ffmpeg, video)
+        if vw and vh:
+            l, t, w, h = crop
+            if l >= vw or t >= vh:
+                raise ValueError(f"crop 起点超出画面（画面 {vw}x{vh}）")
+            w = min(w, vw - l)
+            h = min(h, vh - t)
+            if w < 64 or h < 64:
+                raise ValueError(f"crop 截出来只剩 {int(w)}x{int(h)} 像素，太小了读不出字")
+            crop = (l, t, w, h)
+
     truncated = False
     detected = len(shots)
-    if max_shots and len(shots) > max_shots:
+    if fixed_times is None and max_shots and len(shots) > max_shots:
         step = len(shots) / max_shots
         shots = [shots[int(i * step)] for i in range(max_shots)]
         truncated = True
@@ -131,13 +181,33 @@ def tool_make_storyboard(args):
 
         for i, (s, e) in enumerate(shots):
             png = os.path.join(tmp, f"f{i:03d}.png")
-            sb.grab_frame(ffmpeg, video, sb.pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png)
+            if fixed_times is not None:
+                sb.grab_frame(ffmpeg, video, s, png, crop=crop, crop_scale=zoom)
+            else:
+                sb.grab_frame(ffmpeg, video, sb.pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png,
+                              crop=crop, crop_scale=zoom)
             if os.path.exists(png) and os.path.getsize(png) > 0:
                 frames.append(png)
                 kept.append((s, e))
                 kept_lines.append(shot_lines[i] if shot_lines and i < len(shot_lines) else None)
         if not frames:
             raise ValueError("没抓到任何帧，视频可能是纯黑或无法解码")
+
+        # 指定时刻模式：额外落一份单张高清图，方便逐张细读
+        saved_singles = []
+        if fixed_times is not None:
+            sdir = os.path.join(outdir, f"{stem}_frames")
+            os.makedirs(sdir, exist_ok=True)
+            for i, (s, _e) in enumerate(kept):
+                tag = f"{int(s // 3600):02d}h{int(s % 3600 // 60):02d}m{int(s % 60):02d}s"
+                dst = os.path.join(sdir, f"t{i + 1:02d}_{tag}.png")
+                try:
+                    shutil.copyfile(frames[i], dst)
+                    w0, h0 = sb.report_image_size(dst)
+                    saved_singles.append({"file": os.path.relpath(dst, outdir).replace("\\", "/"),
+                                          "at": round(s, 3), "width": w0, "height": h0})
+                except OSError:
+                    pass
 
         # 分页：每页 per_page 格，长视频不会丢镜头
         total = len(frames)
@@ -162,6 +232,10 @@ def tool_make_storyboard(args):
             "shot_count": len(kept),
             "page_count": page_count,
             "per_page": per_page,
+            "mode": ("at" if args.get("at_times") else
+                     ("auto-keys" if auto_keys else "scene")),
+            "crop": list(crop) if crop else None,
+            "zoom": (zoom if crop else 1.0),
             "truncated": truncated,
             "detected_before_limit": detected,
             "storyboard_image": pages[0][0] if pages else None,
@@ -169,6 +243,9 @@ def tool_make_storyboard(args):
             "dialogue_source": ("whisper.cpp 语音识别（可能不准）" if segments else "无"),
             "shots": [],
         }
+        if saved_singles:
+            data["frames"] = saved_singles
+            data["frames_dir"] = f"{stem}_frames"
         for i, (s, e) in enumerate(kept):
             item = {"no": i + 1, "start": round(s, 2), "end": round(e, 2), "duration": round(e - s, 2)}
             if segments and i < len(kept_lines) and kept_lines[i]:
@@ -193,8 +270,7 @@ def tool_make_storyboard(args):
             pass
         if tmp_dl:
             try:
-                import shutil as _sh
-                _sh.rmtree(tmp_dl, ignore_errors=True)
+                shutil.rmtree(tmp_dl, ignore_errors=True)
             except Exception:
                 pass
 
@@ -286,6 +362,39 @@ TOOLS = [
                     "type": "integer",
                     "description": "最多返回几张图给 AI（避免上下文过大），其余只给文件路径。默认 3",
                     "default": 3,
+                },
+                "at_times": {
+                    "type": "string",
+                    "description": (
+                        "只抽这些时间点，逗号分隔，单位秒或 分:秒，例如 \"95,110,3:20\"。"
+                        "给了它就不做场景检测，直接按指定时刻出图，并额外落一份单张高清图。"
+                        "适合教程、PPT、代码演示——读屏幕上的字比九宫格均分准得多。"
+                    ),
+                },
+                "crop": {
+                    "type": "string",
+                    "description": (
+                        "裁剪区域，四个数「左,上,宽,高」，也可写「左,上,右,下」。"
+                        "配合 at_times 用，只截屏幕某一块再放大，专治小字看不清。"
+                        "例：\"400,250,1200,500\""
+                    ),
+                },
+                "zoom": {
+                    "type": "number",
+                    "description": "裁剪后放大倍数，默认 1。给了 crop 又没给 zoom 时自动按 2 倍放大。",
+                    "default": 1,
+                },
+                "auto_keys": {
+                    "type": "integer",
+                    "description": (
+                        "自动挑 N 个画面信息量最大的时刻，不用手填 at_times。"
+                        "教学视频 / PPT 演示用它比九宫格均分更容易落在内容页上。默认 0=不用"
+                    ),
+                    "default": 0,
+                },
+                "scan": {
+                    "type": "string",
+                    "description": "限制 auto_keys 的搜索范围，写成「起,止」秒，例如 \"180,400\"。",
                 },
             },
             "required": ["video_path"],

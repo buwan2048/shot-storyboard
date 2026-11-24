@@ -193,14 +193,137 @@ def build_shots(scene_times, duration):
     return shots
 
 
-def grab_frame(ffmpeg, video, at, out_png):
-    """在 at 秒处抓一帧（取偏后一点，避开转场的第一帧黑场）"""
+def grab_frame(ffmpeg, video, at, out_png, crop=None, crop_scale=1.0):
+    """在 at 秒处抓一帧（取偏后一点，避开转场的第一帧黑场）
+
+    crop = (左, 上, 宽, 高) 且 crop_scale > 1 时，只截这块区域并放大，
+    用于读屏幕、字幕、代码、表格上的小字。
+    """
+    vf = None
+    if crop:
+        l, t, w, h = crop
+        parts = [f"crop={int(w)}:{int(h)}:{int(max(0, l))}:{int(max(0, t))}"]
+        if crop_scale and abs(crop_scale - 1.0) > 0.01:
+            parts.append(f"scale=iw*{crop_scale:.3f}:ih*{crop_scale:.3f}:flags=lanczos")
+        vf = ",".join(parts)
     cmd = [
         ffmpeg, "-y", "-v", "error",
         "-ss", f"{at:.3f}", "-i", video,
-        "-frames:v", "1", "-q:v", "2", out_png,
     ]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-frames:v", "1", "-q:v", "2", out_png]
     subprocess.run(cmd, capture_output=True)
+
+
+def probe_size(ffmpeg, video):
+    """读画面宽高（读不出返回 (0,0)）"""
+    out = subprocess.run([ffmpeg, "-hide_banner", "-i", video],
+                         capture_output=True, text=True, errors="ignore")
+    m = re.search(r",\s*(\d{2,5})x(\d{2,5})\s*[\[,]", out.stderr)
+    if not m:
+        m = re.search(r"(\d{2,5})x(\d{2,5})", out.stderr)
+    if not m:
+        return (0, 0)
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def parse_time_list(spec):
+    """把 "95,110,200" 或 "1:35,3:20" 解析成秒列表；非法项直接报错退出"""
+    out = []
+    for raw in str(spec).split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        try:
+            if ":" in tok:
+                mm, ss = tok.split(":", 1)
+                out.append(int(mm) * 60 + float(ss))
+            else:
+                out.append(float(tok))
+        except ValueError:
+            sys.exit(f"--at 里有看不懂的时间：{raw!r}（写成 95 或 1:35 都可以）")
+    if not out:
+        sys.exit("--at 没给有效时间点")
+    return out
+
+
+def parse_region(spec):
+    """把 "0,0,960,540" 解析成裁剪区域；也接受 "x0,y0,x1,y1" 的右下角写法"""
+    if not spec:
+        return None
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if len(parts) != 4:
+        sys.exit(f"--crop 要四个数：左,上,宽,高（或 左,上,右,下）。收到 {spec!r}")
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        sys.exit(f"--crop 里有不是数字的：{spec!r}")
+    a, b, c, d = vals
+    if c > a and d > b and (c - a) > 1 and (d - b) > 1 and a >= 0 and b >= 0:
+        return (a, b, c - a, d - b)     # 左下角-右下角写法
+    return (a, b, c, d)
+
+
+def find_busy_times(ffmpeg, video, duration, want=1, sample_step=2.0, scan_from=None, scan_to=None):
+    """挑画面最"满"的时刻：文字/表格/代码教学类视频，画面信息量越大往往越是关键页。
+
+    逐帧算一下边缘能量（粗略信息量），取峰值附近时刻。比固定间隔撒点更可能落在内容页上。
+    """
+    lo = 0.0 if scan_from is None else max(0.0, float(scan_from))
+    hi = duration if scan_to is None else min(duration, float(scan_to))
+    if hi <= lo:
+        return []
+    n = int(max(1, min(120, (hi - lo) / max(0.5, sample_step))))
+    step = (hi - lo) / n
+    cmd = [
+        ffmpeg, "-hide_banner", "-i", video,
+        "-vf", f"fps=1/{step:.4f},scale=320:-1,edgedetect=low=0.1:high=0.3",
+        "-f", "null", "-",
+    ]
+    # ffmpeg 本身不给每个采样帧的信息量，改用信号统计近似：转成灰度再取标准差
+    cmd = [
+        ffmpeg, "-hide_banner", "-i", video,
+        "-vf", f"fps=1/{step:.4f},scale=320:-1,format=gray",
+        "-f", "rawvideo", "-",
+    ]
+    out = subprocess.run(cmd, capture_output=True)
+    data = out.stdout
+    if not data:
+        return [(lo + hi) / 2.0]
+    # rawvideo 帧长 = 宽*高，但 scale 后高度未知；用总长/帧数反推
+    frame_bytes = len(data) // n if n else len(data)
+    if frame_bytes <= 0:
+        return [(lo + hi) / 2.0]
+    scores = []
+    for i in range(n):
+        chunk = data[i * frame_bytes:(i + 1) * frame_bytes]
+        if not chunk:
+            continue
+        # 信息量近似：字节方差（画面越复杂/字越多，方差越大）
+        mean = sum(chunk) / len(chunk)
+        var = sum((b - mean) ** 2 for b in chunk) / len(chunk)
+        scores.append((var, lo + i * step + step * 0.5))
+    if not scores:
+        return [(lo + hi) / 2.0]
+    scores.sort(reverse=True)
+    picked = []
+    min_gap = max(2.0, (hi - lo) / max(2, want * 3))
+    for _score, t in scores:
+        if all(abs(t - p) >= min_gap for p in picked):
+            picked.append(t)
+        if len(picked) >= want:
+            break
+    return sorted(picked)
+
+
+def report_image_size(png):
+    try:
+        with Image.open(png) as im:
+            return im.size
+    except Exception:
+        return (0, 0)
+
 
 
 def fmt_time(sec):
@@ -256,8 +379,11 @@ def make_sheet(frames, shots, out_jpg, cols=4, cell_w=480, pad=10, header=56, sh
         draw.rectangle([x, y, x + 62, y + 46], fill=(0, 0, 0))
         draw.text((x + 12, y + 4), f"{i + 1 + start_index:02d}", fill=(255, 200, 60), font=font_idx)
 
-        # 时间码
-        label = f"start {fmt_time(s)}   dur {e-s:.1f}s"
+        # 时间码：指定时刻模式（起止相同）只报时刻，不装作有持续时长
+        if abs(e - s) < 0.05:
+            label = f"at {fmt_time(s)}   (指定时刻)"
+        else:
+            label = f"start {fmt_time(s)}   dur {e-s:.1f}s"
         draw.text((x + 4, y + cell_h + 6), label, fill=(210, 210, 215), font=font_label)
 
         # 台词
@@ -764,6 +890,19 @@ def main():
     ap.add_argument("--hint", default=None,
                     help="给语音识别的提示词，写上视频里可能出现的专有名词，能显著提升准确率。"
                          "例：--hint \"DeepSeek, 剪映, 提示词\"")
+    ap.add_argument("--at", default=None,
+                    help="只抽这些时间点（秒或 分:秒），逗号分隔。例：--at 95,110,3:20\n"
+                         "给了 --at 就不做场景检测，直接按你指定的时刻出图（教程/幻灯片/代码演示最有用）")
+    ap.add_argument("--crop", default=None,
+                    help="裁剪区域「左,上,宽,高」，也可写成「左,上,右,下」。配合 --at 读屏幕上小字。"
+                         "例：--crop 300,200,900,500")
+    ap.add_argument("--zoom", type=float, default=1.0,
+                    help="裁剪后放大倍数，默认 1.0（配合 --crop 用，2 就是放两倍）")
+    ap.add_argument("--auto-keys", type=int, default=0, metavar="N",
+                    help="自动挑 N 个画面信息量最大的时刻（不用手填 --at）。"
+                         "教学视频/ PPT 演示用它比均分九宫格准。默认 0=不用")
+    ap.add_argument("--scan", default=None,
+                    help="限制 --auto-keys 的搜索范围，写成「起,止」秒。例：--scan 180,400")
     args = ap.parse_args()
 
     ffmpeg = find_ffmpeg()
@@ -792,25 +931,75 @@ def main():
         sys.exit("读不出视频时长，文件可能损坏或不是视频。")
     print(f"      时长 {duration:.2f}s")
 
-    print(f"[2/4] 场景检测 (threshold={args.threshold})")
-    scenes = detect_scenes(ffmpeg, video, args.threshold)
-    shots = build_shots(scenes, duration)
-    print(f"      检测到 {len(scenes)} 个切换点 → {len(shots)} 个镜头")
+    # ---- 指定时间点模式：给了 --at 就跳过场景检测，直接按时刻出图 ----
+    fixed_times = None
+    if args.at:
+        fixed_times = [t for t in parse_time_list(args.at) if 0 <= t <= duration]
+        if not fixed_times:
+            sys.exit(f"--at 给的时间都不在 0~{duration:.1f}s 范围内")
+        bad = [t for t in parse_time_list(args.at) if not (0 <= t <= duration)]
+        if bad:
+            print(f"      忽略超出时长的时刻：{bad}")
+        print(f"[2/4] 指定时间点模式：{len(fixed_times)} 个时刻，跳过场景检测")
+        shots = [(t, t) for t in fixed_times]
+        segments = None
+        shot_lines = None
+    elif args.auto_keys and args.auto_keys > 0:
+        scan_from, scan_to = 0.0, duration
+        if args.scan:
+            try:
+                a, b = [float(x) for x in str(args.scan).split(",")[:2]]
+                scan_from, scan_to = a, b
+            except Exception:
+                sys.exit(f"--scan 要写成「起,止」秒，例 --scan 180,400。收到 {args.scan!r}")
+        print(f"[2/4] 自动挑关键帧：扫描 {scan_from:.0f}s~{scan_to:.0f}s，要 {args.auto_keys} 个")
+        fixed_times = find_busy_times(ffmpeg, video, duration, want=args.auto_keys,
+                                      scan_from=scan_from, scan_to=scan_to)
+        if not fixed_times:
+            sys.exit("自动挑帧失败，改用 --at 指定时间点")
+        print("      选中时刻：" + ", ".join(f"{t:.1f}s" for t in fixed_times))
+        shots = [(t, t) for t in fixed_times]
+        segments = None
+        shot_lines = None
+    else:
+        print(f"[2/4] 场景检测 (threshold={args.threshold})")
+        scenes = detect_scenes(ffmpeg, video, args.threshold)
+        shots = build_shots(scenes, duration)
+        print(f"      检测到 {len(scenes)} 个切换点 → {len(shots)} 个镜头")
 
-    # 兜底：没有明显镜头切换的视频（连续动画、长镜头、幻灯片、AI 逐帧生成）
-    # 场景检测会返回 1 个镜头，整段抽一帧＝抽到黑场，等于白干。
-    # 这种情况改用等间隔抽帧，至少把整条片子采样出来。
-    if len(shots) < 3 and duration >= 6:
-        n = min(12, max(4, int(duration // 5)))
-        step = duration / n
-        shots = [(i * step, min((i + 1) * step, duration)) for i in range(n)]
-        print(f"      无镜头切换，改用等间隔抽 {n} 帧（每 {step:.1f}s 一帧）")
+        # 兜底：没有明显镜头切换的视频（连续动画、长镜头、幻灯片、AI 逐帧生成）
+        # 场景检测会返回 1 个镜头，整段抽一帧＝抽到黑场，等于白干。
+        # 这种情况改用等间隔抽帧，至少把整条片子采样出来。
+        if len(shots) < 3 and duration >= 6:
+            n = min(12, max(4, int(duration // 5)))
+            step = duration / n
+            shots = [(i * step, min((i + 1) * step, duration)) for i in range(n)]
+            print(f"      无镜头切换，改用等间隔抽 {n} 帧（每 {step:.1f}s 一帧）")
 
-    if args.max and args.max > 0 and len(shots) > args.max:
-        # 只有用户显式要求总数上限时才抽样（会丢镜头）
-        step = len(shots) / args.max
-        shots = [shots[int(i * step)] for i in range(args.max)]
-        print(f"      按 --max {args.max} 等间隔抽样（注意：抽样会丢镜头）")
+        if args.max and args.max > 0 and len(shots) > args.max:
+            # 只有用户显式要求总数上限时才抽样（会丢镜头）
+            step = len(shots) / args.max
+            shots = [shots[int(i * step)] for i in range(args.max)]
+            print(f"      按 --max {args.max} 等间隔抽样（注意：抽样会丢镜头）")
+
+    crop = parse_region(args.crop)
+    zoom = max(1.0, float(args.zoom or 1.0))
+    if crop and zoom == 1.0:
+        zoom = 2.0      # 只给 --crop 不给 --zoom 时默认放大两倍，否则截出来更看不清
+    if crop:
+        vw, vh = probe_size(ffmpeg, video)
+        l, t, w, h = crop
+        if vw and vh:
+            if l >= vw or t >= vh:
+                sys.exit(f"--crop 起点超出画面（画面 {vw}x{vh}，你给的是 {args.crop}）")
+            w = min(w, vw - l)
+            h = min(h, vh - t)
+            if w < 64 or h < 64:
+                sys.exit(f"--crop 截出来只剩 {int(w)}x{int(h)} 像素，太小了读不出字。"
+                         f"画面是 {vw}x{vh}，检查一下左上角坐标和宽高")
+            crop = (l, t, w, h)
+        print(f"      裁剪区域 {int(l)},{int(t)} {int(w)}x{int(h)}，放大 {zoom:g} 倍")
+
 
     # 台词（可选，按镜头切分）
     shot_lines = None
@@ -860,9 +1049,14 @@ def main():
     print("[3/4] 抽帧")
     tmp = tempfile.mkdtemp(prefix="sb_")
     frames = []
+    is_fixed = fixed_times is not None
     for i, (s, e) in enumerate(shots):
         png = os.path.join(tmp, f"f{i:03d}.png")
-        grab_frame(ffmpeg, video, pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png)
+        if is_fixed:
+            grab_frame(ffmpeg, video, s, png, crop=crop, crop_scale=zoom)
+        else:
+            grab_frame(ffmpeg, video, pick_frame_time(s, e, shot_lines[i] if shot_lines and i < len(shot_lines) else None), png,
+                       crop=crop, crop_scale=zoom)
         if os.path.exists(png):
             frames.append(png)
         else:
@@ -905,6 +1099,9 @@ def main():
         "shot_count": len(shots),
         "page_count": page_count,
         "per_page": per_page,
+        "mode": "at" if args.at else ("auto-keys" if args.auto_keys else "scene"),
+        "crop": list(crop) if crop else None,
+        "zoom": zoom if crop else 1.0,
         "pages": [
             {"file": os.path.basename(j), "width": w, "height": h, "shots": f"{a}-{b}"}
             for (j, w, h, a, b) in pages
@@ -917,6 +1114,29 @@ def main():
             for i, (s, e) in enumerate(shots)
         ],
     }
+
+    # ---- 指定时间点 / 自动挑帧：额外落一份单张高清图，方便逐张细读 ----
+    saved_singles = []
+    if is_fixed:
+        sdir = os.path.join(outdir, f"{stem}_frames")
+        os.makedirs(sdir, exist_ok=True)
+        for i, (s, _e) in enumerate(shots):
+            tag = f"{int(s // 3600):02d}h{int(s % 3600 // 60):02d}m{int(s % 60):02d}s"
+            name = f"t{i + 1:02d}_{tag}.png"
+            dst = os.path.join(sdir, name)
+            png = os.path.join(tmp, f"f{i:03d}.png")
+            if os.path.exists(png):
+                try:
+                    import shutil
+                    shutil.copyfile(png, dst)
+                    saved_singles.append({"file": os.path.relpath(dst, outdir),
+                                          "at": round(s, 3),
+                                          "width": report_image_size(dst)[0],
+                                          "height": report_image_size(dst)[1]})
+                except OSError:
+                    pass
+        if saved_singles:
+            data["frames"] = saved_singles
     if segments:
         data["transcript"] = segments
     js = os.path.join(outdir, f"{stem}_shots.json")
@@ -936,6 +1156,10 @@ def main():
     print()
     for (j, w, h, a, b) in pages:
         print(f"宫格图 : {j}  ({w}x{h})  镜头 {a}-{b}")
+    if saved_singles:
+        print(f"单张图 : {os.path.join(outdir, stem + '_frames')}  ({len(saved_singles)} 张，原尺寸)")
+        for it in saved_singles:
+            print(f"         {it['file']}   {it['at']}s   {it['width']}x{it['height']}")
     print(f"镜头表 : {js}")
     print(f"镜头数 : {len(shots)}")
     print()

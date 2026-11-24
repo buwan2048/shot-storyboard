@@ -45,10 +45,32 @@ make_storyboard(
 1. **文字**：精确的镜头时间表（每个镜头的起止秒数和时长）
 2. **图片**：宫格图，每格标了编号和时间码
 
+**如果用户问的是教程 / PPT / 直播回放 / 代码演示**（画面长时间不变、关键信息在文字上），
+别用默认的九宫格——它按镜头切，这类视频只有一两个镜头，抽出来全落在废话上。改用这两个：
+
+```
+# 用户告诉了你第几秒有内容
+make_storyboard(video_path="...", at_times="95,110,3:20")
+
+# 用户也不知道关键页在哪 → 让它自己挑画面最满的时刻
+make_storyboard(video_path="...", auto_keys=6, scan="180,380")
+
+# 字太小看不清 → 截一块再放大
+make_storyboard(video_path="...", at_times="3:20", crop="400,250,800,250", zoom=2)
+```
+
+`at_times` / `auto_keys` 模式下会额外落一份单张原图到 `<视频名>_frames/`，
+返回值里 `frames` 字段是每张的路径和时刻。**读小字时优先看这些单张图，别在九宫格里硬猜。**
+
 没有 MCP 时，用命令行：
 
 ```bash
 python storyboard.py "D:/片子.mp4" --threshold 0.3 --cols 4 --max 24
+
+# 教程类
+python storyboard.py "D:/教程.mp4" --at 95,110,200
+python storyboard.py "D:/教程.mp4" --at 3:20 --crop 400,250,800,250 --zoom 2
+python storyboard.py "D:/长视频.mp4" --auto-keys 6 --scan 180,380
 ```
 
 然后读同目录下生成的 `*_storyboard.jpg` 和 `*_shots.json`。
