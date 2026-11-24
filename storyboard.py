@@ -90,7 +90,28 @@ def find_ffmpeg():
         p = shutil.which(name)
         if p:
             return p
-    sys.exit("找不到 ffmpeg。请安装 ffmpeg 并确保在 PATH 里。")
+    if sys.platform == "win32":
+        hint = (
+            "没有找到 ffmpeg。二选一：\n"
+            "  ① 命令行装：  winget install Gyan.FFmpeg\n"
+            "  ② 手动下：    https://www.gyan.dev/ffmpeg/builds/  下 essentials 版，\n"
+            "     解压后把里面的 bin 目录加到系统环境变量 PATH 里，然后重开终端。\n"
+            "装完验证：  ffmpeg -version"
+        )
+    elif sys.platform == "darwin":
+        hint = (
+            "没有找到 ffmpeg。装一下：\n"
+            "  brew install ffmpeg\n"
+            "装完验证：  ffmpeg -version"
+        )
+    else:
+        hint = (
+            "没有找到 ffmpeg。装一下：\n"
+            "  sudo apt install ffmpeg      （Debian/Ubuntu）\n"
+            "  sudo dnf install ffmpeg      （Fedora）\n"
+            "装完验证：  ffmpeg -version"
+        )
+    sys.exit(hint)
 
 
 def load_font(size):
