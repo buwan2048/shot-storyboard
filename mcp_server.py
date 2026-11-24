@@ -150,7 +150,7 @@ def tool_make_storyboard(args):
                     else f"{stem}_storyboard_p{pi+1}.jpg")
             jpg = os.path.join(outdir, name)
             sb.make_sheet(frames[a:b], kept[a:b], jpg, cols=cols,
-                          shot_lines=(kept_lines[a:b] if segments else None),
+                          shot_lines=(kept_lines[a:b] if segments else None), start_index=a,
                           page_info=((pi + 1, page_count, total) if page_count > 1 else None))
             _shrink(jpg, MAX_IMAGE_SIDE)
             pages.append((jpg, a + 1, b))
