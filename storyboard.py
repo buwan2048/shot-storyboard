@@ -797,6 +797,15 @@ def main():
     shots = build_shots(scenes, duration)
     print(f"      检测到 {len(scenes)} 个切换点 → {len(shots)} 个镜头")
 
+    # 兜底：没有明显镜头切换的视频（连续动画、长镜头、幻灯片、AI 逐帧生成）
+    # 场景检测会返回 1 个镜头，整段抽一帧＝抽到黑场，等于白干。
+    # 这种情况改用等间隔抽帧，至少把整条片子采样出来。
+    if len(shots) < 3 and duration >= 6:
+        n = min(12, max(4, int(duration // 5)))
+        step = duration / n
+        shots = [(i * step, min((i + 1) * step, duration)) for i in range(n)]
+        print(f"      无镜头切换，改用等间隔抽 {n} 帧（每 {step:.1f}s 一帧）")
+
     if args.max and args.max > 0 and len(shots) > args.max:
         # 只有用户显式要求总数上限时才抽样（会丢镜头）
         step = len(shots) / args.max
