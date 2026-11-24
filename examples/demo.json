@@ -1,0 +1,74 @@
+{
+  "video": "D:\\dsh-workspace\\短片-来一口\\成片\\拼接-全片1到6.mp4",
+  "duration": 30.17,
+  "threshold": 0.3,
+  "shot_count": 11,
+  "shots": [
+    {
+      "no": 1,
+      "start": 0.0,
+      "end": 2.417,
+      "duration": 2.417
+    },
+    {
+      "no": 2,
+      "start": 2.417,
+      "end": 5.167,
+      "duration": 2.75
+    },
+    {
+      "no": 3,
+      "start": 5.167,
+      "end": 10.125,
+      "duration": 4.958
+    },
+    {
+      "no": 4,
+      "start": 10.125,
+      "end": 12.208,
+      "duration": 2.083
+    },
+    {
+      "no": 5,
+      "start": 12.208,
+      "end": 15.083,
+      "duration": 2.875
+    },
+    {
+      "no": 6,
+      "start": 15.083,
+      "end": 17.292,
+      "duration": 2.208
+    },
+    {
+      "no": 7,
+      "start": 17.292,
+      "end": 20.042,
+      "duration": 2.75
+    },
+    {
+      "no": 8,
+      "start": 20.042,
+      "end": 21.583,
+      "duration": 1.542
+    },
+    {
+      "no": 9,
+      "start": 21.583,
+      "end": 25.0,
+      "duration": 3.417
+    },
+    {
+      "no": 10,
+      "start": 25.0,
+      "end": 27.917,
+      "duration": 2.917
+    },
+    {
+      "no": 11,
+      "start": 27.917,
+      "end": 30.17,
+      "duration": 2.253
+    }
+  ]
+}
