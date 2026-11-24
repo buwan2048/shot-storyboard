@@ -102,19 +102,41 @@ def tool_make_storyboard(args):
         truncated = True
 
     tmp = tempfile.mkdtemp(prefix="sb_mcp_")
-    frames, kept = [], []
+    frames, kept, kept_lines = [], [], []
     try:
+        # 先转录（要在截断后的 shots 上切分台词）
+        shot_lines = None
+        segments = None
+        transcribe = args.get("transcribe", True)
+        if transcribe:
+            cpp = sb.find_whisper_cpp()
+            if cpp:
+                log(f"转录中: {os.path.basename(cpp[1])}")
+                segs, err = sb.transcribe_cpp(video, cpp[0], cpp[1], ffmpeg,
+                                              "zh", args.get("hint"), tmp)
+                if segs:
+                    segs, dropped = sb.clean_segments(segs, duration=duration)
+                    if dropped:
+                        log(f"过滤 {dropped} 条疑似幻觉")
+                    segments = segs
+                    shot_lines = sb.split_lines_by_shot(segs, shots)
+                else:
+                    log(f"转录跳过: {err}")
+            else:
+                log("跳过台词：没找到 whisper.cpp（工具目录下要有 whisper-cpp/）")
+
         for i, (s, e) in enumerate(shots):
             png = os.path.join(tmp, f"f{i:03d}.png")
             sb.grab_frame(ffmpeg, video, s + min(0.35, (e - s) * 0.35), png)
             if os.path.exists(png) and os.path.getsize(png) > 0:
                 frames.append(png)
                 kept.append((s, e))
+                kept_lines.append(shot_lines[i] if shot_lines and i < len(shot_lines) else None)
         if not frames:
             raise ValueError("没抓到任何帧，视频可能是纯黑或无法解码")
 
         jpg = os.path.join(outdir, f"{stem}_storyboard.jpg")
-        sb.make_sheet(frames, kept, jpg, cols=cols)
+        sb.make_sheet(frames, kept, jpg, cols=cols, shot_lines=kept_lines)
 
         # 压到 AI 友好尺寸，别把 300KB 的图原样塞进上下文
         _shrink(jpg, MAX_IMAGE_SIDE)
@@ -127,11 +149,16 @@ def tool_make_storyboard(args):
             "truncated": truncated,
             "detected_before_limit": detected,
             "storyboard_image": jpg,
-            "shots": [
-                {"no": i + 1, "start": round(s, 2), "end": round(e, 2), "duration": round(e - s, 2)}
-                for i, (s, e) in enumerate(kept)
-            ],
+            "dialogue_source": ("whisper.cpp 语音识别（可能不准）" if segments else "无"),
+            "shots": [],
         }
+        for i, (s, e) in enumerate(kept):
+            item = {"no": i + 1, "start": round(s, 2), "end": round(e, 2), "duration": round(e - s, 2)}
+            if segments and i < len(kept_lines) and kept_lines[i]:
+                item["lines"] = [x["text"] for x in kept_lines[i]]
+            data["shots"].append(item)
+        if segments:
+            data["transcript"] = segments
         js = os.path.join(outdir, f"{stem}_shots.json")
         with open(js, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -178,13 +205,19 @@ def _human_summary(d):
         "镜头表：",
     ]
     for s in d["shots"]:
-        lines.append(f"  #{s['no']:02d}  {s['start']:6.2f}s → {s['end']:6.2f}s  ({s['duration']:.2f}s)")
+        base = f"  #{s['no']:02d}  {s['start']:6.2f}s → {s['end']:6.2f}s  ({s['duration']:.2f}s)"
+        if s.get("lines"):
+            base += "  「" + " ".join(s["lines"]) + "」"
+        lines.append(base)
+    if d.get("dialogue_source"):
+        lines += ["", f"台词来源：{d['dialogue_source']}"]
     lines += [
         "",
         f"宫格图：{d['storyboard_image']}",
         f"镜头表：{d['shots_json']}",
         "",
         "判断节奏时可以看：镜头平均时长、有没有长镜头拖沓、切换是否规律。",
+        "台词是语音识别，专有名词可能听错、短句可能漏，引用关键台词前最好对一下原片。",
     ]
     return "\n".join(lines)
 
