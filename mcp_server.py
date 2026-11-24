@@ -58,15 +58,19 @@ def tool_make_storyboard(args):
 
     threshold = float(args.get("threshold", 0.3))
     cols = int(args.get("cols", 4))
-    max_shots = int(args.get("max_shots", args.get("max", 24)))
+    per_page = int(args.get("per_page", 24))
+    max_shots = int(args.get("max_shots", 0))
+    max_images = int(args.get("max_images", 3))
     outdir = args.get("outdir")
 
     if not (0.0 < threshold < 1.0):
         raise ValueError("threshold 必须在 0 和 1 之间（建议 0.2~0.5）")
     if not (1 <= cols <= 8):
         raise ValueError("cols 必须在 1~8 之间")
-    if not (1 <= max_shots <= 100):
-        raise ValueError("max_shots 必须在 1~100 之间")
+    if not (1 <= per_page <= 100):
+        raise ValueError("per_page 必须在 1~100 之间")
+    if max_shots < 0:
+        raise ValueError("max_shots 不能为负（0 表示不限制）")
 
     ffmpeg = sb.find_ffmpeg()
 
@@ -96,7 +100,7 @@ def tool_make_storyboard(args):
 
     truncated = False
     detected = len(shots)
-    if len(shots) > max_shots:
+    if max_shots and len(shots) > max_shots:
         step = len(shots) / max_shots
         shots = [shots[int(i * step)] for i in range(max_shots)]
         truncated = True
@@ -135,20 +139,33 @@ def tool_make_storyboard(args):
         if not frames:
             raise ValueError("没抓到任何帧，视频可能是纯黑或无法解码")
 
-        jpg = os.path.join(outdir, f"{stem}_storyboard.jpg")
-        sb.make_sheet(frames, kept, jpg, cols=cols, shot_lines=kept_lines)
-
-        # 压到 AI 友好尺寸，别把 300KB 的图原样塞进上下文
-        _shrink(jpg, MAX_IMAGE_SIDE)
+        # 分页：每页 per_page 格，长视频不会丢镜头
+        total = len(frames)
+        page_count = (total + per_page - 1) // per_page
+        pages = []
+        for pi in range(page_count):
+            a = pi * per_page
+            b = min(a + per_page, total)
+            name = (f"{stem}_storyboard.jpg" if page_count == 1
+                    else f"{stem}_storyboard_p{pi+1}.jpg")
+            jpg = os.path.join(outdir, name)
+            sb.make_sheet(frames[a:b], kept[a:b], jpg, cols=cols,
+                          shot_lines=(kept_lines[a:b] if segments else None),
+                          page_info=((pi + 1, page_count, total) if page_count > 1 else None))
+            _shrink(jpg, MAX_IMAGE_SIDE)
+            pages.append((jpg, a + 1, b))
 
         data = {
             "video": video,
             "duration": round(duration, 2),
             "threshold": threshold,
             "shot_count": len(kept),
+            "page_count": page_count,
+            "per_page": per_page,
             "truncated": truncated,
             "detected_before_limit": detected,
-            "storyboard_image": jpg,
+            "storyboard_image": pages[0][0] if pages else None,
+            "pages": [{"file": os.path.basename(j), "shots": f"{a}-{b}"} for j, a, b in pages],
             "dialogue_source": ("whisper.cpp 语音识别（可能不准）" if segments else "无"),
             "shots": [],
         }
@@ -163,7 +180,7 @@ def tool_make_storyboard(args):
         with open(js, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         data["shots_json"] = js
-        return data, jpg
+        return data, pages
     finally:
         for p in frames:
             try:
@@ -213,7 +230,7 @@ def _human_summary(d):
         lines += ["", f"台词来源：{d['dialogue_source']}"]
     lines += [
         "",
-        f"宫格图：{d['storyboard_image']}",
+        f"宫格图：{d.get('page_count', 1)} 张，第一张 {d.get('pages', [{}])[0].get('file', '')}",
         f"镜头表：{d['shots_json']}",
         "",
         "判断节奏时可以看：镜头平均时长、有没有长镜头拖沓、切换是否规律。",
@@ -257,8 +274,18 @@ TOOLS = [
                 },
                 "max_shots": {
                     "type": "integer",
-                    "description": "最多保留几个镜头，默认 24，超出会等间隔抽样",
+                    "description": "总共最多保留几个镜头（抽样会丢镜头）。0 或不填 = 不限制，长视频靠分页。默认 0",
+                    "default": 0,
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "每张宫格图最多放几个镜头，超出自动分成多张图。默认 24",
                     "default": 24,
+                },
+                "max_images": {
+                    "type": "integer",
+                    "description": "最多返回几张图给 AI（避免上下文过大），其余只给文件路径。默认 3",
+                    "default": 3,
                 },
             },
             "required": ["video_path"],
@@ -303,15 +330,22 @@ def handle(msg):
         if name != "make_storyboard":
             return reply(msg_id, error=f"未知工具: {name}")
         try:
-            data, jpg = tool_make_storyboard(args)
-            with open(jpg, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            size_kb = os.path.getsize(jpg) // 1024
-            content = [
-                {"type": "text", "text": _human_summary(data)},
-                {"type": "image", "data": b64, "mimeType": "image/jpeg"},
-                {"type": "text", "text": f"（宫格图约 {size_kb} KB，{data['shot_count']} 格）"},
-            ]
+            data, pages = tool_make_storyboard(args)
+            limit = int(args.get("max_images", 3))
+            content = [{"type": "text", "text": _human_summary(data)}]
+            for idx, (jpg, a, b) in enumerate(pages):
+                if idx >= limit:
+                    break
+                with open(jpg, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                if data["page_count"] > 1:
+                    content.append({"type": "text",
+                                    "text": f"第 {idx+1}/{data['page_count']} 张（镜头 {a}-{b}）"})
+                content.append({"type": "image", "data": b64, "mimeType": "image/jpeg"})
+            if len(pages) > limit:
+                content.append({"type": "text",
+                                "text": f"还有 {len(pages)-limit} 张没发出来（避免上下文过大）。" +
+                                        f"文件都在 {os.path.dirname(pages[0][0])}，需要的话告诉我。"})
             return reply(msg_id, {"content": content, "isError": False})
         except Exception as e:
             log(f"tool error: {e}")
