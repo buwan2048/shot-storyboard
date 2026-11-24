@@ -50,13 +50,11 @@ def log(msg):
 # ---------------------------------------------------------------- 工具实现
 
 def tool_make_storyboard(args):
-    """执行一次抽帧宫格，返回 (文字摘要, 图片路径)"""
-    video = args.get("video_path") or args.get("video")
+    """执行一次抽帧宫格，返回 (数据字典, 图片路径)"""
+    video = args.get("video_path") or args.get("video") or args.get("url")
     if not video:
-        raise ValueError("缺少参数 video_path")
-    video = os.path.abspath(str(video))
-    if not os.path.isfile(video):
-        raise ValueError(f"找不到视频文件：{video}")
+        raise ValueError("缺少参数 video_path（本地路径或视频链接）")
+    video = str(video).strip()
 
     threshold = float(args.get("threshold", 0.3))
     cols = int(args.get("cols", 4))
@@ -71,8 +69,22 @@ def tool_make_storyboard(args):
         raise ValueError("max_shots 必须在 1~100 之间")
 
     ffmpeg = sb.find_ffmpeg()
-    stem = os.path.splitext(os.path.basename(video))[0]
-    outdir = os.path.abspath(outdir) if outdir else os.path.dirname(video)
+
+    tmp_dl = None
+    if sb.is_url(video):
+        # 网络链接（B站/YouTube 等）：先下载
+        tmp_dl = tempfile.mkdtemp(prefix="sb_mcp_dl_")
+        log(f"下载中: {video}")
+        video = sb.download_video(video, tmp_dl, ffmpeg)
+        stem = "网络视频"
+        outdir = os.path.abspath(outdir) if outdir else os.path.join(tempfile.gettempdir(), "storyboard_out")
+    else:
+        video = os.path.abspath(video)
+        if not os.path.isfile(video):
+            raise ValueError(f"找不到视频文件：{video}")
+        stem = os.path.splitext(os.path.basename(video))[0]
+        outdir = os.path.abspath(outdir) if outdir else os.path.dirname(video)
+
     os.makedirs(outdir, exist_ok=True)
 
     duration = sb.probe_duration(ffmpeg, video)
@@ -83,6 +95,7 @@ def tool_make_storyboard(args):
     shots = sb.build_shots(scenes, duration)
 
     truncated = False
+    detected = len(shots)
     if len(shots) > max_shots:
         step = len(shots) / max_shots
         shots = [shots[int(i * step)] for i in range(max_shots)]
@@ -112,7 +125,7 @@ def tool_make_storyboard(args):
             "threshold": threshold,
             "shot_count": len(kept),
             "truncated": truncated,
-            "detected_before_limit": len(scenes) + 1,
+            "detected_before_limit": detected,
             "storyboard_image": jpg,
             "shots": [
                 {"no": i + 1, "start": round(s, 2), "end": round(e, 2), "duration": round(e - s, 2)}
@@ -134,6 +147,12 @@ def tool_make_storyboard(args):
             os.rmdir(tmp)
         except OSError:
             pass
+        if tmp_dl:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmp_dl, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def _shrink(jpg_path, max_side):
@@ -282,6 +301,8 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+    # 关键：把 storyboard 的进度输出全部改到 stderr，绝不能碰 stdout（那是协议流）
+    sb.set_logger(lambda m: log(m))
     log(f"启动，协议版本 {PROTOCOL_VERSION}")
     for line in sys.stdin:
         line = line.strip()
